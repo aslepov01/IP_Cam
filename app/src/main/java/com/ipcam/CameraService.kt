@@ -2375,6 +2375,33 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             }
         }
     }
+
+    private fun resetMjpegFpsCounters(
+        reason: String,
+        onlyWhenIdle: Boolean = false,
+        broadcastImmediately: Boolean = true
+    ): Boolean {
+        if (onlyWhenIdle && getMjpegClientCount() > 0) {
+            return false
+        }
+
+        var changed = false
+        synchronized(mjpegFpsLock) {
+            if (currentMjpegFps != 0f || mjpegFpsFrameTimes.isNotEmpty()) {
+                currentMjpegFps = 0f
+                mjpegFpsFrameTimes.clear()
+                lastMjpegFpsCalculation = 0L
+                changed = true
+                Log.d(TAG, "Reset MJPEG FPS to 0 ($reason)")
+            }
+        }
+
+        if (changed && broadcastImmediately) {
+            broadcastImmediateTelemetrySnapshot()
+        }
+
+        return changed
+    }
     
     /**
      * Check and reset FPS counters when no clients are connected
@@ -2384,16 +2411,8 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         var needsMetricsBroadcast = false
         
         // Check MJPEG FPS - reset if no clients and FPS is not zero
-        if (getMjpegClientCount() == 0) {
-            synchronized(mjpegFpsLock) {
-                if (currentMjpegFps != 0f || mjpegFpsFrameTimes.isNotEmpty()) {
-                    currentMjpegFps = 0f
-                    mjpegFpsFrameTimes.clear()
-                    lastMjpegFpsCalculation = 0L
-                    needsMetricsBroadcast = true
-                    Log.d(TAG, "Reset MJPEG FPS to 0 (no clients)")
-                }
-            }
+        if (resetMjpegFpsCounters("no MJPEG clients", onlyWhenIdle = true, broadcastImmediately = false)) {
+            needsMetricsBroadcast = true
         }
         
         // Check RTSP FPS - reset if no clients and FPS is not zero
@@ -4279,6 +4298,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     
     override fun unregisterMjpegConsumer() {
         unregisterConsumer(ConsumerType.MJPEG)
+        resetMjpegFpsCounters("last MJPEG client disconnected", onlyWhenIdle = true)
     }
     
     override fun registerSnapshotConsumer() {
