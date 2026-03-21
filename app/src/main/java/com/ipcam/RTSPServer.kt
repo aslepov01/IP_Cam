@@ -139,13 +139,6 @@ class RTSPServer(
             return false
         }
 
-        /**
-         * Compute the maximum number of concurrent RTSP sessions allowed, derived from the
-         * global HTTP connection cap.  Mirrors [HttpServer.maxStreamsPerIp]: one quarter of
-         * the global limit (minimum 1) so that RTSP scales proportionally with the HTTP cap.
-         * Falls back to a default of 32 when the cap cannot be read.
-         */
-        fun maxRtspSessions(maxConnections: Int): Int = maxOf(1, maxConnections / 4)
     }
     
     /**
@@ -156,8 +149,8 @@ class RTSPServer(
         val socket: Socket,
         @Volatile var state: SessionState = SessionState.INIT
     ) {
-        // Numeric ID for bandwidth tracking (extracted from sessionId)
-        val numericId: Long = sessionId.removePrefix("session").toLongOrNull() ?: System.currentTimeMillis()
+        val startTimeMs: Long = System.currentTimeMillis()
+        @Volatile var playingStartedAtMs: Long = 0L
         
         var clientAddress: InetAddress? = null
         var clientRtpPort: Int = 0
@@ -758,28 +751,7 @@ class RTSPServer(
         
         val session = RTSPSession(sessionId, socket)
         sessions[sessionId] = session
-
-        // Enforce session limit: evict the globally oldest session when the cap is exceeded.
-        // The limit is derived from the global HTTP max-connections setting (1/4, min 1) so
-        // that it scales proportionally (e.g. 8 RTSP sessions at the default 32 global cap).
-        val maxSessions = maxRtspSessions(cameraService?.getMaxConnections() ?: 32)
-        if (sessions.size > maxSessions) {
-            val oldest = sessions.values
-                .filter { it.sessionId != sessionId }
-                .minByOrNull { it.numericId }
-            if (oldest != null) {
-                Log.w(
-                    TAG,
-                    "Max RTSP sessions ($maxSessions) reached, closing oldest session " +
-                    "${oldest.sessionId} (${oldest.socket.inetAddress}) to accept $sessionId"
-                )
-                try {
-                    oldest.socket.close()
-                } catch (e: Exception) {
-                    Log.d(TAG, "Error closing evicted RTSP session ${oldest.sessionId}", e)
-                }
-            }
-        }
+        cameraService?.onLongLivedConnectionsChanged()
         
         try {
             val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
@@ -833,6 +805,7 @@ class RTSPServer(
                 // Ignore
             }
             Log.d(TAG, "Client disconnected: $sessionId")
+            cameraService?.onLongLivedConnectionsChanged()
         }
     }
     
@@ -1058,7 +1031,12 @@ class RTSPServer(
         val cseq = headers["cseq"] ?: "0"
         
         acquireCameraLease(session.sessionId, "PLAY")
+        if (session.state != SessionState.PLAYING) {
+            session.playingStartedAtMs = System.currentTimeMillis()
+        }
         session.state = SessionState.PLAYING
+        enforceRtspPlayingSessionLimit(session)
+        cameraService?.onLongLivedConnectionsChanged()
         Log.d(TAG, "Client ${session.sessionId} started playing")
         
         writer.write("RTSP/1.0 200 OK\r\n")
@@ -1073,7 +1051,9 @@ class RTSPServer(
         val cseq = headers["cseq"] ?: "0"
         
         session.state = SessionState.INIT
+        session.playingStartedAtMs = 0L
         releaseCameraLease(session.sessionId, "TEARDOWN")
+        cameraService?.onLongLivedConnectionsChanged()
         
         // Close RTP/RTCP sockets
         try {
@@ -1094,7 +1074,9 @@ class RTSPServer(
         val cseq = headers["cseq"] ?: "0"
         
         session.state = SessionState.READY
+        session.playingStartedAtMs = 0L
         releaseCameraLease(session.sessionId, "PAUSE")
+        cameraService?.onLongLivedConnectionsChanged()
         
         writer.write("RTSP/1.0 200 OK\r\n")
         writer.write("CSeq: $cseq\r\n")
@@ -1788,6 +1770,7 @@ class RTSPServer(
                     }
                 }
                 sessions.clear()
+                cameraService?.onLongLivedConnectionsChanged()
                 
                 // Stop server job first
                 serverJob?.cancel()
@@ -1856,6 +1839,64 @@ class RTSPServer(
      * considered alive as long as its accept-loop is running.
      */
     fun isAlive(): Boolean = isRunning.get()
+
+    fun getConnectionSnapshots(): List<ConnectionSnapshot> {
+        return sessions.values
+            .map { session ->
+                ConnectionSnapshot(
+                    id = "rtsp:${session.sessionId}",
+                    kind = ConnectionKind.RTSP,
+                    state = session.state.name,
+                    remoteAddr = session.socket.inetAddress?.hostAddress ?: "unknown",
+                    endpoint = "rtsp://:8554/stream",
+                    startTimeMs = session.startTimeMs
+                )
+            }
+            .sortedBy { it.startTimeMs }
+    }
+
+    fun closeConnection(connectionId: String): Boolean {
+        if (!connectionId.startsWith("rtsp:")) {
+            return false
+        }
+
+        val sessionId = connectionId.removePrefix("rtsp:")
+        val session = sessions[sessionId] ?: return false
+        return try {
+            session.socket.close()
+            true
+        } catch (e: Exception) {
+            Log.d(TAG, "Error closing RTSP session $sessionId", e)
+            false
+        }
+    }
+
+    private fun enforceRtspPlayingSessionLimit(currentSession: RTSPSession) {
+        val maxSessions = cameraService?.getConnectionLimits()?.maxRtspSessions
+            ?: ConnectionLimits.DEFAULT.maxRtspSessions
+
+        while (sessions.values.count { it.state == SessionState.PLAYING } > maxSessions) {
+            val oldestPlayingSession = sessions.values
+                .filter { it.sessionId != currentSession.sessionId && it.state == SessionState.PLAYING }
+                .minByOrNull { session ->
+                    if (session.playingStartedAtMs > 0L) session.playingStartedAtMs else session.startTimeMs
+                }
+                ?: break
+
+            Log.w(
+                TAG,
+                "RTSP playing-session limit ($maxSessions) reached, closing oldest playing session " +
+                    "${oldestPlayingSession.sessionId} (${oldestPlayingSession.socket.inetAddress}) " +
+                    "to admit ${currentSession.sessionId}"
+            )
+            try {
+                oldestPlayingSession.socket.close()
+            } catch (e: Exception) {
+                Log.d(TAG, "Error closing evicted RTSP session ${oldestPlayingSession.sessionId}", e)
+                break
+            }
+        }
+    }
     
     /**
      * Get server metrics
@@ -1885,7 +1926,8 @@ class RTSPServer(
             bitrateMode = bitrateModeName,
             activeSessions = sessions.size,
             playingSessions = sessions.values.count { it.state == SessionState.PLAYING },
-            maxSessions = maxRtspSessions(cameraService?.getMaxConnections() ?: 32),
+            maxSessions = cameraService?.getConnectionLimits()?.maxRtspSessions
+                ?: ConnectionLimits.DEFAULT.maxRtspSessions,
             framesEncoded = frameCount.get(),
             droppedFrames = droppedFrameCount.get(),
             targetFps = fps,
@@ -1966,7 +2008,7 @@ class RTSPServer(
         val bitrateMode: String,
         val activeSessions: Int,
         val playingSessions: Int,
-        /** Maximum concurrent sessions allowed (derived as 1/4 of the global HTTP max-connections). */
+        /** Maximum concurrent RTSP playing sessions allowed. */
         val maxSessions: Int,
         val framesEncoded: Long,
         val droppedFrames: Long,

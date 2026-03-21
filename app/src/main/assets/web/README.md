@@ -29,7 +29,7 @@ The following template variables are replaced at runtime in `index.html`:
 - `{{displayName}}` - Device name or "IP Camera Server"
 - `{{versionString}}` - App version (from BuildInfo)
 - `{{buildString}}` - Build information (from BuildInfo)
-- `{{connectionDisplay}}` - Active/max connections (e.g., "2/32")
+- `{{connectionDisplay}}` - Active long-lived connection summary (e.g., "3 active")
 
 ## How It Works
 

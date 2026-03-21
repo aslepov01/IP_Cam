@@ -103,7 +103,6 @@ import java.util.concurrent.atomic.AtomicReference
  * -------------------
  * - cameraExecutor: Single thread for CameraX analysis callbacks
  * - processingExecutor: 2-thread pool for image processing (rotation, JPEG encoding)
- * - streamingExecutor: Cached thread pool for HTTP streaming connections
  * 
  * - All executors shut down in onDestroy() with proper cleanup:
  *   1. Camera executor (stops frame capture)
@@ -320,22 +319,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     private var networkReceiver: BroadcastReceiver? = null
     private var batteryReceiver: BroadcastReceiver? = null
     @Volatile private var actualPort: Int = PORT // The actual port being used (may differ from PORT if unavailable)
-    // Server-Sent Events (SSE) clients for real-time updates
-    private val sseClients = mutableListOf<SSEClient>()
-    private val sseClientsLock = Any()
-    // Dedicated executor for streaming connections (doesn't block HTTP request threads)
-    private val streamingExecutor = Executors.newCachedThreadPool { r -> 
-        Thread(r, "StreamingThread-${System.currentTimeMillis()}").apply {
-            isDaemon = true
-        }
-    }
-    // Track active streaming connections
-    private val activeStreams = AtomicInteger(0)
-    // Track active connections with details
-    private val activeConnections = mutableMapOf<Long, ConnectionInfo>()
-    private val connectionsLock = Any()
-    // User-configurable max connections setting
-    @Volatile private var maxConnections: Int = HTTP_DEFAULT_MAX_POOL_SIZE
+    @Volatile private var connectionLimits: ConnectionLimits = ConnectionLimits.DEFAULT
     // Track if server was intentionally stopped (don't auto-restart in watchdog)
     @Volatile private var serverIntentionallyStopped: Boolean = false
     
@@ -480,16 +464,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
          private const val CAMERA_REBIND_DEBOUNCE_MS = 500L // Minimum time between rebind requests
          // Intent extras
          const val EXTRA_START_SERVER = "start_server"
-         // Thread pool settings for NanoHTTPD
-         // Maximum parallel connections: HTTP_MAX_POOL_SIZE (32 concurrent connections)
-         // Separate pools for request handlers and long-lived streaming connections
-         // Requests beyond max are queued up to HTTP_QUEUE_CAPACITY (50), then rejected
-         private const val HTTP_CORE_POOL_SIZE = 4
-         private const val HTTP_DEFAULT_MAX_POOL_SIZE = 32  // Default max connections
-         private const val HTTP_MIN_MAX_POOL_SIZE = 4  // Minimum allowed max connections
-         private const val HTTP_ABSOLUTE_MAX_POOL_SIZE = 100  // Absolute maximum connections
-         private const val HTTP_KEEP_ALIVE_TIME = 60L
-         private const val HTTP_QUEUE_CAPACITY = 50 // Max queued requests before rejecting
          // JPEG compression quality settings
          private const val JPEG_QUALITY_CAMERA = 70 // Lower quality to reduce memory pressure
          private const val JPEG_QUALITY_SNAPSHOT = 85 // Higher quality for snapshots
@@ -500,28 +474,11 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
          // Camera activation delay
          private const val CAMERA_ACTIVATION_DELAY_MS = 500L // Delay before activating camera when consumer registers
          // Settings keys
-         private const val PREF_MAX_CONNECTIONS = "maxConnections"
+         private const val PREF_LEGACY_MAX_CONNECTIONS = "maxConnections"
+         private const val PREF_MAX_MJPEG_STREAMS = "maxMjpegStreams"
+         private const val PREF_MAX_SSE_CLIENTS = "maxSseClients"
+         private const val PREF_MAX_RTSP_SESSIONS = "maxRtspSessions"
      }
-     
-     /**
-      * Represents details about an active HTTP connection
-      */
-     data class ConnectionInfo(
-         val id: Long,
-         val remoteAddr: String,
-         val endpoint: String,
-         val startTime: Long,
-         @Volatile var active: Boolean = true
-     )
-     
-     /**
-      * Represents a Server-Sent Events client connection
-      */
-     private data class SSEClient(
-         val id: Long,
-         val outputStream: java.io.OutputStream,
-         @Volatile var active: Boolean = true
-     )
      
     override val lifecycle: Lifecycle
         get() = lifecycleRegistry
@@ -830,9 +787,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             wifiDebuggingManager?.startMonitoring()
             
             val startMsg = if (actualPort != PORT) {
-                "Server started on port $actualPort with max $maxConnections connections (default port $PORT was unavailable)"
+                "Server started on port $actualPort with connection limits $connectionLimits (default port $PORT was unavailable)"
             } else {
-                "Server started on port $actualPort with max $maxConnections connections"
+                "Server started on port $actualPort with connection limits $connectionLimits"
             }
             Log.d(TAG, startMsg)
             
@@ -2516,9 +2473,25 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         
         // Adaptive quality is currently removed from runtime logic.
         adaptiveQualityEnabled = false
-        
-        maxConnections = prefs.getInt(PREF_MAX_CONNECTIONS, HTTP_DEFAULT_MAX_POOL_SIZE)
-            .coerceIn(HTTP_MIN_MAX_POOL_SIZE, HTTP_ABSOLUTE_MAX_POOL_SIZE)
+
+        connectionLimits = if (
+            prefs.contains(PREF_MAX_MJPEG_STREAMS) ||
+            prefs.contains(PREF_MAX_SSE_CLIENTS) ||
+            prefs.contains(PREF_MAX_RTSP_SESSIONS)
+        ) {
+            ConnectionLimits(
+                maxMjpegStreams = prefs.getInt(PREF_MAX_MJPEG_STREAMS, ConnectionLimits.DEFAULT.maxMjpegStreams),
+                maxSseClients = prefs.getInt(PREF_MAX_SSE_CLIENTS, ConnectionLimits.DEFAULT.maxSseClients),
+                maxRtspSessions = prefs.getInt(PREF_MAX_RTSP_SESSIONS, ConnectionLimits.DEFAULT.maxRtspSessions)
+            ).normalized()
+        } else {
+            val legacyMaxConnections = prefs.getInt(
+                PREF_LEGACY_MAX_CONNECTIONS,
+                ConnectionLimits.DEFAULT.maxMjpegStreams
+            )
+            ConnectionLimits.fromLegacyMaxConnections(legacyMaxConnections)
+        }
+
         isFlashlightOn = prefs.getBoolean("flashlightOn", false)
         
         // NOTE: RTSP is now on-demand only, no persistence of enabled state
@@ -2576,7 +2549,10 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             Log.d(TAG, "Cleaned up old resolution format keys")
         }
         
-        Log.d(TAG, "Loaded settings: camera=$cameraType, orientation=$cameraOrientation, rotation=$rotation, resolution=${selectedResolution?.let { "${it.width}x${it.height}" } ?: "auto"}, maxConnections=$maxConnections, flashlight=$isFlashlightOn, mjpegFps=$targetMjpegFps, rtspFps=$targetRtspFps, rtspBitrate=$rtspBitrate, rtspBitrateMode=$rtspBitrateMode, adaptiveQuality=$adaptiveQualityEnabled, deviceName=$deviceName")
+        Log.d(
+            TAG,
+            "Loaded settings: camera=$cameraType, orientation=$cameraOrientation, rotation=$rotation, resolution=${selectedResolution?.let { "${it.width}x${it.height}" } ?: "auto"}, connectionLimits=$connectionLimits, flashlight=$isFlashlightOn, mjpegFps=$targetMjpegFps, rtspFps=$targetRtspFps, rtspBitrate=$rtspBitrate, rtspBitrateMode=$rtspBitrateMode, adaptiveQuality=$adaptiveQualityEnabled, deviceName=$deviceName"
+        )
     }
     
     private fun saveSettings() {
@@ -2597,8 +2573,12 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             
             // Keep deprecated setting persisted as disabled for compatibility.
             putBoolean("adaptiveQualityEnabled", false)
-            
-            putInt(PREF_MAX_CONNECTIONS, maxConnections)
+
+            putInt(PREF_MAX_MJPEG_STREAMS, connectionLimits.maxMjpegStreams)
+            putInt(PREF_MAX_SSE_CLIENTS, connectionLimits.maxSseClients)
+            putInt(PREF_MAX_RTSP_SESSIONS, connectionLimits.maxRtspSessions)
+            remove(PREF_LEGACY_MAX_CONNECTIONS)
+            remove("maxMjpegStreamsPerIp")
             putBoolean("flashlightOn", isFlashlightOn)
             
             // NOTE: RTSP enabled state is NOT persisted (on-demand only)
@@ -2825,9 +2805,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     }
     
     override fun getActiveConnectionsCount(): Int {
-        // Return the count of all HTTP connections from HttpServer
-        // This includes MJPEG streams + SSE clients
-        return (httpServer?.getActiveStreamsCount() ?: 0) + (httpServer?.getActiveSseClientsCount() ?: 0)
+        return getConnectionSnapshots().count { it.active }
     }
     
     override fun getMjpegClientCount(): Int {
@@ -2846,63 +2824,44 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         return getMjpegClientCount() + getRtspClientCount()
     }
     
-    fun getActiveConnectionsList(): List<ConnectionInfo> {
-        synchronized(connectionsLock) {
-            return activeConnections.values.filter { it.active }.toList()
+    override fun getConnectionLimits(): ConnectionLimits = connectionLimits
+
+    override fun updateConnectionLimits(limits: ConnectionLimits): Boolean {
+        val normalizedLimits = limits.normalized()
+        if (normalizedLimits == connectionLimits) {
+            return false
         }
-    }
-    
-    override fun getMaxConnections(): Int = maxConnections
-    
-    override fun setMaxConnections(max: Int): Boolean {
-        val newMax = max.coerceIn(HTTP_MIN_MAX_POOL_SIZE, HTTP_ABSOLUTE_MAX_POOL_SIZE)
-        if (newMax != maxConnections) {
-            maxConnections = newMax
-            saveSettings()
-            // Notify MainActivity of max connections change
-            // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-            safeInvokeCameraStateCallback(currentCamera)
-            // Note: Server needs to be restarted for the change to take effect
-            return true
-        }
-        return false
-    }
-    
-    fun closeConnection(connectionId: Long): Boolean {
-        synchronized(connectionsLock) {
-            val conn = activeConnections[connectionId]
-            if (conn != null && conn.active) {
-                conn.active = false
-                activeConnections.remove(connectionId)
-                Log.d(TAG, "Manually closed connection $connectionId")
-                notifyConnectionsChanged()
-                return true
-            }
-        }
-        return false
-    }
-    
-    private fun registerConnection(id: Long, remoteAddr: String, endpoint: String) {
-        synchronized(connectionsLock) {
-            activeConnections[id] = ConnectionInfo(id, remoteAddr, endpoint, System.currentTimeMillis())
-        }
-        notifyConnectionsChanged()
-    }
-    
-    private fun unregisterConnection(id: Long) {
-        synchronized(connectionsLock) {
-            val conn = activeConnections[id]
-            if (conn != null) {
-                conn.active = false
-                activeConnections.remove(id)
-            }
-        }
-        notifyConnectionsChanged()
-    }
-    
-    private fun notifyConnectionsChanged() {
-        // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
+
+        connectionLimits = normalizedLimits
+        saveSettings()
+        broadcastCameraState()
+        safeInvokeCameraStateCallback(currentCamera)
         safeInvokeConnectionsCallback()
+        broadcastImmediateTelemetrySnapshot()
+        return true
+    }
+
+    override fun getConnectionSnapshots(): List<ConnectionSnapshot> {
+        val httpConnections = httpServer?.getConnectionSnapshots().orEmpty()
+        val rtspConnections = rtspServer?.getConnectionSnapshots().orEmpty()
+        return (httpConnections + rtspConnections).sortedBy { it.startTimeMs }
+    }
+
+    override fun closeConnection(connectionId: String): Boolean {
+        val closed = httpServer?.closeConnection(connectionId) == true ||
+            rtspServer?.closeConnection(connectionId) == true
+
+        if (closed) {
+            Log.d(TAG, "Manually closed connection $connectionId")
+            onLongLivedConnectionsChanged()
+        }
+
+        return closed
+    }
+
+    override fun onLongLivedConnectionsChanged() {
+        safeInvokeConnectionsCallback()
+        broadcastImmediateTelemetrySnapshot()
     }
     
     fun isServerRunning(): Boolean = httpServer?.isAlive() == true
@@ -3022,9 +2981,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             processingExecutor.shutdownNow()
             Thread.currentThread().interrupt()
         }
-        
-        // 3. Streaming executor (stops client connections)
-        streamingExecutor.shutdownNow() // Forcefully terminate streaming threads
         
         clearLastProcessedFrame("service destroy")
         
@@ -3471,7 +3427,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         val batteryInfo = getCachedBatteryInfo()
         val activeHttpStreams = httpServer?.getActiveStreamsCount() ?: 0
         val activeSseClients = httpServer?.getActiveSseClientsCount() ?: 0
-        val rtspPlayingSessions = rtspServer?.getMetrics()?.playingSessions ?: 0
+        val rtspMetrics = rtspServer?.getMetrics()
+        val activeRtspConnections = rtspMetrics?.activeSessions ?: 0
+        val rtspPlayingSessions = rtspMetrics?.playingSessions ?: 0
         val currentRtspFpsForSnapshot = if (rtspEnabled && rtspPlayingSessions > 0) {
             currentRtspFps
         } else {
@@ -3485,8 +3443,10 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             currentRtspFps = currentRtspFpsForSnapshot,
             activeHttpStreams = activeHttpStreams,
             activeSseClients = activeSseClients,
+            activeRtspConnections = activeRtspConnections,
             rtspPlayingSessions = rtspPlayingSessions,
             totalCameraClients = activeHttpStreams + rtspPlayingSessions,
+            totalLongLivedConnections = activeHttpStreams + activeSseClients + activeRtspConnections,
             batteryLevel = batteryInfo.level,
             isCharging = batteryInfo.isCharging,
             nowMs = nowMs
@@ -3497,7 +3457,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         val batteryInfo = getCachedBatteryInfo()
         val activeHttpStreams = httpServer?.getActiveStreamsCount() ?: 0
         val activeSseClients = httpServer?.getActiveSseClientsCount() ?: 0
-        val rtspPlayingSessions = rtspServer?.getMetrics()?.playingSessions ?: 0
+        val rtspMetrics = rtspServer?.getMetrics()
+        val activeRtspConnections = rtspMetrics?.activeSessions ?: 0
+        val rtspPlayingSessions = rtspMetrics?.playingSessions ?: 0
         val currentRtspFpsForSnapshot = if (rtspEnabled && rtspPlayingSessions > 0) {
             currentRtspFps
         } else {
@@ -3511,8 +3473,10 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             currentRtspFps = currentRtspFpsForSnapshot,
             activeHttpStreams = activeHttpStreams,
             activeSseClients = activeSseClients,
+            activeRtspConnections = activeRtspConnections,
             rtspPlayingSessions = rtspPlayingSessions,
             totalCameraClients = activeHttpStreams + rtspPlayingSessions,
+            totalLongLivedConnections = activeHttpStreams + activeSseClients + activeRtspConnections,
             batteryLevel = batteryInfo.level,
             isCharging = batteryInfo.isCharging
         )
@@ -3811,8 +3775,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         val cameraName = if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"
         val resolutionLabel = selectedResolution?.let { sizeLabel(it) } ?: "auto"
         val rtspEnabled = isRTSPEnabled()
+        val limits = connectionLimits
 
-        return """{"camera":"$cameraName","resolution":"$resolutionLabel","cameraOrientation":"$cameraOrientation","rotation":$rotation,"showDateTimeOverlay":$showDateTimeOverlay,"showBatteryOverlay":$showBatteryOverlay,"showResolutionOverlay":$showResolutionOverlay,"showFpsOverlay":$showFpsOverlay,"targetMjpegFps":$targetMjpegFps,"targetRtspFps":$targetRtspFps,"adaptiveQualityEnabled":false,"flashlightAvailable":${isFlashlightAvailable()},"flashlightOn":${isFlashlightEnabled()},"batteryMode":"${batteryMode.name}","streamingAllowed":${isStreamingAllowed()},"rtspEnabled":$rtspEnabled}"""
+        return """{"camera":"$cameraName","resolution":"$resolutionLabel","cameraOrientation":"$cameraOrientation","rotation":$rotation,"showDateTimeOverlay":$showDateTimeOverlay,"showBatteryOverlay":$showBatteryOverlay,"showResolutionOverlay":$showResolutionOverlay,"showFpsOverlay":$showFpsOverlay,"targetMjpegFps":$targetMjpegFps,"targetRtspFps":$targetRtspFps,"maxMjpegStreams":${limits.maxMjpegStreams},"maxSseClients":${limits.maxSseClients},"maxRtspSessions":${limits.maxRtspSessions},"adaptiveQualityEnabled":false,"flashlightAvailable":${isFlashlightAvailable()},"flashlightOn":${isFlashlightEnabled()},"batteryMode":"${batteryMode.name}","streamingAllowed":${isStreamingAllowed()},"rtspEnabled":$rtspEnabled}"""
     }
     
     /**
@@ -3824,6 +3789,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         val cameraName = if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"
         val resolutionLabel = selectedResolution?.let { sizeLabel(it) } ?: "auto"
         val rtspEnabled = isRTSPEnabled()
+        val limits = connectionLimits
 
         val currentState = mapOf<String, Any>(
             "camera" to cameraName,
@@ -3836,6 +3802,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             "showFpsOverlay" to showFpsOverlay,
             "targetMjpegFps" to targetMjpegFps,
             "targetRtspFps" to targetRtspFps,
+            "maxMjpegStreams" to limits.maxMjpegStreams,
+            "maxSseClients" to limits.maxSseClients,
+            "maxRtspSessions" to limits.maxRtspSessions,
             "adaptiveQualityEnabled" to false,
             "flashlightAvailable" to isFlashlightAvailable(),
             "flashlightOn" to isFlashlightEnabled(),
@@ -3887,6 +3856,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     override fun initializeLastBroadcastState() {
         val cameraName = if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"
         val resolutionLabel = selectedResolution?.let { sizeLabel(it) } ?: "auto"
+        val limits = connectionLimits
         
         synchronized(broadcastLock) {
             lastBroadcastState.clear()
@@ -3900,6 +3870,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             lastBroadcastState["showFpsOverlay"] = showFpsOverlay
             lastBroadcastState["targetMjpegFps"] = targetMjpegFps
             lastBroadcastState["targetRtspFps"] = targetRtspFps
+            lastBroadcastState["maxMjpegStreams"] = limits.maxMjpegStreams
+            lastBroadcastState["maxSseClients"] = limits.maxSseClients
+            lastBroadcastState["maxRtspSessions"] = limits.maxRtspSessions
             lastBroadcastState["adaptiveQualityEnabled"] = false
             lastBroadcastState["flashlightAvailable"] = isFlashlightAvailable()
             lastBroadcastState["flashlightOn"] = isFlashlightEnabled()

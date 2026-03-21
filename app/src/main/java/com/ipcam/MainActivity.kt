@@ -51,7 +51,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var startStopButton: Button
     private lateinit var autoStartCheckBox: android.widget.CheckBox
     private lateinit var activeConnectionsText: TextView
-    private lateinit var maxConnectionsSpinner: Spinner
+    private lateinit var maxMjpegStreamsSpinner: Spinner
+    private lateinit var maxSseClientsSpinner: Spinner
+    private lateinit var maxRtspSessionsSpinner: Spinner
     private lateinit var versionInfoText: TextView
     // Device name controls
     private lateinit var deviceNameEditText: android.widget.EditText
@@ -266,6 +268,7 @@ class MainActivity : AppCompatActivity() {
                         // Resolution spinner only needs updating when:
                         // 1. Camera switches (different supported resolutions) - handled in switchCamera()
                         // 2. User explicitly changes resolution - handled in applyResolution()
+                        loadConnectionLimitOptions()
                         loadCameraOrientationOptions()
                         loadRotationOptions()
                     } finally {
@@ -293,7 +296,7 @@ class MainActivity : AppCompatActivity() {
                 loadResolutions()
                 loadCameraOrientationOptions()
                 loadRotationOptions()
-                loadMaxConnectionsOptions()
+                loadConnectionLimitOptions()
                 loadOsdSettings()
                 loadFpsSettings()
                 loadDeviceName()
@@ -366,7 +369,9 @@ class MainActivity : AppCompatActivity() {
         startStopButton = findViewById(R.id.startStopButton)
         autoStartCheckBox = findViewById(R.id.autoStartCheckBox)
         activeConnectionsText = findViewById(R.id.activeConnectionsText)
-        maxConnectionsSpinner = findViewById(R.id.maxConnectionsSpinner)
+        maxMjpegStreamsSpinner = findViewById(R.id.maxMjpegStreamsSpinner)
+        maxSseClientsSpinner = findViewById(R.id.maxSseClientsSpinner)
+        maxRtspSessionsSpinner = findViewById(R.id.maxRtspSessionsSpinner)
         versionInfoText = findViewById(R.id.versionInfoText)
         // Device name controls
         deviceNameEditText = findViewById(R.id.deviceNameEditText)
@@ -469,7 +474,7 @@ class MainActivity : AppCompatActivity() {
         setupCameraOrientationSpinner()
         setupRotationSpinner()
         setupAutoStartCheckBox()
-        setupMaxConnectionsSpinner()
+        setupConnectionLimitSpinners()
         setupOsdCheckBoxes()
         setupMjpegFpsSpinner()
         setupDeviceNameControls()
@@ -1021,51 +1026,71 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
-    private fun setupMaxConnectionsSpinner() {
-        maxConnectionsSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+    private fun setupConnectionLimitSpinners() {
+        val listener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                val selectedItem = parent?.getItemAtPosition(position) as? String
-                if (selectedItem != null && cameraService?.isServerRunning() == true) {
-                    applyMaxConnections(selectedItem)
-                }
+                if (isUpdatingSpinners) return
+                applyConnectionLimitsFromSpinners()
             }
-            
+
             override fun onNothingSelected(parent: AdapterView<*>?) {
                 // Do nothing
             }
         }
+
+        maxMjpegStreamsSpinner.onItemSelectedListener = listener
+        maxSseClientsSpinner.onItemSelectedListener = listener
+        maxRtspSessionsSpinner.onItemSelectedListener = listener
     }
-    
-    private fun loadMaxConnectionsOptions() {
+
+    private fun loadConnectionLimitOptions() {
         val service = cameraService ?: return
-        
-        // Create options: 4, 8, 16, 32, 64, 100
-        val options = listOf(4, 8, 16, 32, 64, 100)
-        val items = options.map { it.toString() }
-        
-        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, items)
-        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
-        maxConnectionsSpinner.adapter = adapter
-        
-        // Set current selection
-        val currentMax = service.getMaxConnections()
-        val index = options.indexOf(currentMax)
-        if (index >= 0) {
-            maxConnectionsSpinner.setSelection(index)
-        } else {
-            // Find closest match
-            val closest = options.minByOrNull { kotlin.math.abs(it - currentMax) }
-            val closestIndex = closest?.let { options.indexOf(it) } ?: 3 // Default to 32
-            maxConnectionsSpinner.setSelection(closestIndex)
+        val limits = service.getConnectionLimits()
+        val options = listOf(1, 2, 4, 8, 16, 32, 64, 100)
+
+        fun bindSpinner(spinner: Spinner, selectedValue: Int) {
+            val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, options.map { it.toString() })
+            adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+            spinner.adapter = adapter
+
+            val index = options.indexOf(selectedValue)
+            if (index >= 0) {
+                spinner.setSelection(index)
+            } else {
+                val closest = options.minByOrNull { kotlin.math.abs(it - selectedValue) } ?: options[0]
+                spinner.setSelection(options.indexOf(closest))
+            }
         }
+
+        bindSpinner(maxMjpegStreamsSpinner, limits.maxMjpegStreams)
+        bindSpinner(maxSseClientsSpinner, limits.maxSseClients)
+        bindSpinner(maxRtspSessionsSpinner, limits.maxRtspSessions)
     }
-    
-    private fun applyMaxConnections(selection: String) {
+
+    private fun applyConnectionLimitsFromSpinners() {
         val service = cameraService ?: return
-        val newMax = selection.toIntOrNull() ?: return
-        
-        if (service.setMaxConnections(newMax)) {
-            Toast.makeText(this, "Max connections set to $newMax. Please restart server for changes to take effect.", Toast.LENGTH_LONG).show()
+
+        val rawLimits = ConnectionLimits(
+            maxMjpegStreams = (maxMjpegStreamsSpinner.selectedItem as? String)?.toIntOrNull() ?: return,
+            maxSseClients = (maxSseClientsSpinner.selectedItem as? String)?.toIntOrNull() ?: return,
+            maxRtspSessions = (maxRtspSessionsSpinner.selectedItem as? String)?.toIntOrNull() ?: return
+        )
+        val normalizedLimits = rawLimits.normalized()
+        val changed = service.updateConnectionLimits(normalizedLimits)
+
+        if (changed) {
+            Toast.makeText(this, getString(R.string.connection_limits_updated), Toast.LENGTH_SHORT).show()
+        }
+
+        if (normalizedLimits != rawLimits) {
+            isUpdatingSpinners = true
+            try {
+                loadConnectionLimitOptions()
+            } finally {
+                activeConnectionsText.post {
+                    isUpdatingSpinners = false
+                }
+            }
         }
     }
     
@@ -1165,7 +1190,7 @@ class MainActivity : AppCompatActivity() {
     private fun updateConnectionsUI() {
         val service = cameraService ?: run {
             // Clear all displays when service is not available
-            activeConnectionsText.text = getString(R.string.connections_count, 0, 0)
+            activeConnectionsText.text = getString(R.string.connections_summary, 0, 0, 0, 0)
             mjpegClientsText.text = getString(R.string.mjpeg_clients, 0)
             rtspClientsText.text = getString(R.string.rtsp_clients, 0)
             totalClientsText.text = getString(R.string.total_clients, 0)
@@ -1175,7 +1200,7 @@ class MainActivity : AppCompatActivity() {
         }
         
         if (!service.isServerRunning()) {
-            activeConnectionsText.text = getString(R.string.connections_count, 0, service.getMaxConnections())
+            activeConnectionsText.text = getString(R.string.connections_summary, 0, 0, 0, 0)
             mjpegClientsText.text = getString(R.string.mjpeg_clients, 0)
             rtspClientsText.text = getString(R.string.rtsp_clients, 0)
             totalClientsText.text = getString(R.string.total_clients, 0)
@@ -1184,10 +1209,18 @@ class MainActivity : AppCompatActivity() {
             return
         }
         
-        // Get active connection count from tracked connections
-        val activeCount = service.getActiveConnectionsCount()
-        val maxConns = service.getMaxConnections()
-        activeConnectionsText.text = getString(R.string.connections_count, activeCount, maxConns)
+        // Summarize all long-lived connections (MJPEG, SSE, RTSP)
+        val snapshots = service.getConnectionSnapshots()
+        val activeCount = snapshots.count { it.active }
+        val sseCount = snapshots.count { it.kind == ConnectionKind.SSE && it.active }
+        val rtspConnectionCount = snapshots.count { it.kind == ConnectionKind.RTSP && it.active }
+        activeConnectionsText.text = getString(
+            R.string.connections_summary,
+            activeCount,
+            service.getMjpegClientCount(),
+            sseCount,
+            rtspConnectionCount
+        )
         
         // Get client counts
         val mjpegCount = service.getMjpegClientCount()
@@ -1383,8 +1416,10 @@ class MainActivity : AppCompatActivity() {
         cameraOrientationSpinner.isEnabled = isCameraAvailable
         rotationSpinner.isEnabled = isCameraAvailable
         
-        // Max connections: only enabled when server is running
-        maxConnectionsSpinner.isEnabled = isRunning
+        // Connection limits: configurable whenever the service is available
+        maxMjpegStreamsSpinner.isEnabled = isCameraAvailable
+        maxSseClientsSpinner.isEnabled = isCameraAvailable
+        maxRtspSessionsSpinner.isEnabled = isCameraAvailable
         
         // Update flashlight button
         updateFlashlightButton()

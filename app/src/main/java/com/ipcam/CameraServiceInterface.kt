@@ -51,8 +51,11 @@ interface CameraServiceInterface {
     fun getMjpegClientCount(): Int
     fun getRtspClientCount(): Int
     fun getTotalCameraClientCount(): Int
-    fun getMaxConnections(): Int
-    fun setMaxConnections(max: Int): Boolean
+    fun getConnectionLimits(): ConnectionLimits
+    fun updateConnectionLimits(limits: ConnectionLimits): Boolean
+    fun getConnectionSnapshots(): List<ConnectionSnapshot>
+    fun closeConnection(connectionId: String): Boolean
+    fun onLongLivedConnectionsChanged()
     fun restartServer()
     
     // Bandwidth and monitoring

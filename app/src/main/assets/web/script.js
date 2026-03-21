@@ -358,15 +358,17 @@
                             return;
                         }
                         
-                        let html = '<table><tr><th>ID</th><th>Remote Address</th><th>Endpoint</th><th>Duration (s)</th><th>Action</th></tr>';
+                        let html = '<table><tr><th>ID</th><th>Kind</th><th>State</th><th>Remote Address</th><th>Endpoint</th><th>Duration (s)</th><th>Action</th></tr>';
                         
                         connections.forEach(conn => {
                             html += '<tr>';
                             html += '<td>' + conn.id + '</td>';
+                            html += '<td>' + String(conn.kind || '').toUpperCase() + '</td>';
+                            html += '<td>' + conn.state + '</td>';
                             html += '<td>' + conn.remoteAddr + '</td>';
                             html += '<td>' + conn.endpoint + '</td>';
                             html += '<td>' + Math.floor(conn.duration / 1000) + '</td>';
-                            html += '<td><button onclick="closeConnection(' + conn.id + ')" class="danger" style="padding: 6px 12px; font-size: 12px;">Close</button></td>';
+                            html += '<td><button onclick="closeConnection(' + JSON.stringify(conn.id) + ')" class="danger" style="padding: 6px 12px; font-size: 12px;">Close</button></td>';
                             html += '</tr>';
                         });
                         
@@ -379,7 +381,7 @@
                             return;
                         }
                         
-                        fetch('/closeConnection?id=' + id)
+                        fetch('/closeConnection?id=' + encodeURIComponent(id))
                             .then(response => response.json())
                             .then(data => {
                                 showAlert(data.message, 'success');
@@ -390,15 +392,57 @@
                             });
                     }
 
-                    function applyMaxConnections() {
-                        const value = document.getElementById('maxConnectionsSelect').value;
-                        fetch('/setMaxConnections?value=' + value)
+                    function updateConnectionLimitSelect(selectId, value) {
+                        const select = document.getElementById(selectId);
+                        if (!select || value === undefined) {
+                            return;
+                        }
+
+                        const options = select.options;
+                        let closestIndex = 0;
+                        let closestDistance = Number.POSITIVE_INFINITY;
+                        for (let i = 0; i < options.length; i++) {
+                            const optionValue = parseInt(options[i].value, 10);
+                            const distance = Math.abs(optionValue - value);
+                            if (distance < closestDistance) {
+                                closestDistance = distance;
+                                closestIndex = i;
+                            }
+                            if (optionValue === value) {
+                                if (select.selectedIndex !== i) {
+                                    select.selectedIndex = i;
+                                }
+                                return;
+                            }
+                        }
+
+                        if (select.selectedIndex !== closestIndex) {
+                            select.selectedIndex = closestIndex;
+                        }
+                    }
+
+                    function applyConnectionLimits() {
+                        const mjpegStreams = document.getElementById('maxMjpegStreamsSelect').value;
+                        const sseClients = document.getElementById('maxSseClientsSelect').value;
+                        const rtspSessions = document.getElementById('maxRtspSessionsSelect').value;
+                        const query = new URLSearchParams({
+                            mjpegStreams,
+                            sseClients,
+                            rtspSessions
+                        });
+
+                        fetch('/setConnectionLimits?' + query.toString())
                             .then(response => response.json())
                             .then(data => {
+                                if (data.connectionLimits) {
+                                    updateConnectionLimitSelect('maxMjpegStreamsSelect', data.connectionLimits.maxMjpegStreams);
+                                    updateConnectionLimitSelect('maxSseClientsSelect', data.connectionLimits.maxSseClients);
+                                    updateConnectionLimitSelect('maxRtspSessionsSelect', data.connectionLimits.maxRtspSessions);
+                                }
                                 showAlert(data.message, 'success');
                             })
                             .catch(error => {
-                                showAlert('Error setting max connections: ' + error, 'danger');
+                                showAlert('Error updating connection limits: ' + error, 'danger');
                             });
                     }
 
@@ -597,23 +641,20 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                     let lastReceivedState = {};
                     let lastReceivedMetrics = {};
                     
-                    // Load max connections and battery status from server status
+                    // Load connection limits and battery status from server status
                     fetch('/status')
                         .then(response => response.json())
                         .then(data => {
-                            const select = document.getElementById('maxConnectionsSelect');
-                            const options = select.options;
-                            for (let i = 0; i < options.length; i++) {
-                                if (parseInt(options[i].value) === data.maxConnections) {
-                                    select.selectedIndex = i;
-                                    break;
-                                }
+                            if (data.connectionLimits) {
+                                updateConnectionLimitSelect('maxMjpegStreamsSelect', data.connectionLimits.maxMjpegStreams);
+                                updateConnectionLimitSelect('maxSseClientsSelect', data.connectionLimits.maxSseClients);
+                                updateConnectionLimitSelect('maxRtspSessionsSelect', data.connectionLimits.maxRtspSessions);
                             }
 
                             const connectionCount = document.getElementById('connectionCount');
-                            if (connectionCount && data.connections) {
-                                connectionCount.textContent = data.connections;
-                                lastConnectionCount = data.connections;
+                            if (connectionCount && data.connectionDisplay) {
+                                connectionCount.textContent = data.connectionDisplay;
+                                lastConnectionCount = data.connectionDisplay;
                             }
 
                             if (data.batteryMode && data.streamingAllowed !== undefined) {
@@ -634,9 +675,10 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                             return;
                         }
 
-                        const activeConnections = (metrics.activeHttpStreams || 0) + (metrics.activeSseClients || 0);
-                        const maxConnections = parseInt(document.getElementById('maxConnectionsSelect')?.value || '0', 10);
-                        const displayValue = maxConnections > 0 ? (activeConnections + '/' + maxConnections) : String(activeConnections);
+                        const activeConnections = metrics.totalLongLivedConnections !== undefined
+                            ? metrics.totalLongLivedConnections
+                            : (metrics.activeHttpStreams || 0) + (metrics.activeSseClients || 0) + (metrics.activeRtspConnections || 0);
+                        const displayValue = activeConnections === 1 ? '1 active' : activeConnections + ' active';
 
                         connectionCount.textContent = displayValue;
                         if (lastConnectionCount !== displayValue) {
@@ -808,7 +850,23 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                                 updateRtspStatusDisplay();
                             }
 
-                            if (deltaState.maxConnections !== undefined) {
+                            if (deltaState.maxMjpegStreams !== undefined) {
+                                updateConnectionLimitSelect('maxMjpegStreamsSelect', state.maxMjpegStreams);
+                            }
+
+                            if (deltaState.maxSseClients !== undefined) {
+                                updateConnectionLimitSelect('maxSseClientsSelect', state.maxSseClients);
+                            }
+
+                            if (deltaState.maxRtspSessions !== undefined) {
+                                updateConnectionLimitSelect('maxRtspSessionsSelect', state.maxRtspSessions);
+                            }
+
+                            if (
+                                deltaState.maxMjpegStreams !== undefined ||
+                                deltaState.maxSseClients !== undefined ||
+                                deltaState.maxRtspSessions !== undefined
+                            ) {
                                 applyMetrics(lastReceivedMetrics);
                             }
 

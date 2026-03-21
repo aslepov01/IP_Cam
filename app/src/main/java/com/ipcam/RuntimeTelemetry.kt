@@ -18,13 +18,15 @@ data class RuntimeTelemetrySnapshot(
     val currentRtspFps: Float,
     val activeHttpStreams: Int,
     val activeSseClients: Int,
+    val activeRtspConnections: Int,
     val rtspPlayingSessions: Int,
     val totalCameraClients: Int,
+    val totalLongLivedConnections: Int,
     val batteryLevel: Int,
     val isCharging: Boolean
 ) {
     fun toJson(): String {
-        return """{"timestampMs":$timestampMs,"cpuUsagePercent":$cpuUsagePercent,"bandwidthBps":$bandwidthBps,"mjpegBandwidthBps":$mjpegBandwidthBps,"rtspBandwidthBps":$rtspBandwidthBps,"currentCameraFps":$currentCameraFps,"currentMjpegFps":$currentMjpegFps,"currentRtspFps":$currentRtspFps,"activeHttpStreams":$activeHttpStreams,"activeSseClients":$activeSseClients,"rtspPlayingSessions":$rtspPlayingSessions,"totalCameraClients":$totalCameraClients,"batteryLevel":$batteryLevel,"isCharging":$isCharging}"""
+        return """{"timestampMs":$timestampMs,"cpuUsagePercent":$cpuUsagePercent,"bandwidthBps":$bandwidthBps,"mjpegBandwidthBps":$mjpegBandwidthBps,"rtspBandwidthBps":$rtspBandwidthBps,"currentCameraFps":$currentCameraFps,"currentMjpegFps":$currentMjpegFps,"currentRtspFps":$currentRtspFps,"activeHttpStreams":$activeHttpStreams,"activeSseClients":$activeSseClients,"activeRtspConnections":$activeRtspConnections,"rtspPlayingSessions":$rtspPlayingSessions,"totalCameraClients":$totalCameraClients,"totalLongLivedConnections":$totalLongLivedConnections,"batteryLevel":$batteryLevel,"isCharging":$isCharging}"""
     }
 
     fun toDebugString(): String {
@@ -38,10 +40,12 @@ data class RuntimeTelemetrySnapshot(
             Camera FPS: ${String.format("%.1f", currentCameraFps)}
             MJPEG FPS: ${String.format("%.1f", currentMjpegFps)}
             RTSP FPS: ${String.format("%.1f", currentRtspFps)}
-            HTTP Streams: $activeHttpStreams
+            MJPEG Streams: $activeHttpStreams
             SSE Clients: $activeSseClients
+            RTSP Connections: $activeRtspConnections
             RTSP Playing Sessions: $rtspPlayingSessions
             Camera Clients: $totalCameraClients
+            Long-Lived Connections: $totalLongLivedConnections
             Battery: $batteryLevel%${if (isCharging) " charging" else ""}
         """.trimIndent()
     }
@@ -59,8 +63,10 @@ data class RuntimeTelemetrySnapshot(
                 currentRtspFps = 0f,
                 activeHttpStreams = 0,
                 activeSseClients = 0,
+                activeRtspConnections = 0,
                 rtspPlayingSessions = 0,
                 totalCameraClients = 0,
+                totalLongLivedConnections = 0,
                 batteryLevel = 0,
                 isCharging = false
             )
@@ -93,8 +99,10 @@ class RuntimeTelemetrySampler {
         currentRtspFps: Float,
         activeHttpStreams: Int,
         activeSseClients: Int,
+        activeRtspConnections: Int,
         rtspPlayingSessions: Int,
         totalCameraClients: Int,
+        totalLongLivedConnections: Int,
         batteryLevel: Int,
         isCharging: Boolean,
         nowMs: Long = System.currentTimeMillis()
@@ -124,8 +132,10 @@ class RuntimeTelemetrySampler {
             currentRtspFps = currentRtspFps,
             activeHttpStreams = activeHttpStreams,
             activeSseClients = activeSseClients,
+            activeRtspConnections = activeRtspConnections,
             rtspPlayingSessions = rtspPlayingSessions,
             totalCameraClients = totalCameraClients,
+            totalLongLivedConnections = totalLongLivedConnections,
             batteryLevel = batteryLevel,
             isCharging = isCharging
         )

@@ -571,7 +571,7 @@
                             android:id="@+id/activeConnectionsText"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="@string/connections_count"
+                            android:text="@string/connections_summary"
                             android:textSize="13sp"
                             android:textColor="#757575"
                             android:layout_marginBottom="8dp"/>
@@ -579,24 +579,43 @@
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="@string/max_connections_label"
+                            android:text="@string/max_mjpeg_streams_label"
                             android:textSize="13sp"
                             />
 
                         <Spinner
-                            android:id="@+id/maxConnectionsSpinner"
+                            android:id="@+id/maxMjpegStreamsSpinner"
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
                             android:minHeight="48dp"
-                            android:layout_marginBottom="4dp"/>
+                            android:layout_marginBottom="8dp"/>
 
                         <TextView
                             android:layout_width="match_parent"
                             android:layout_height="wrap_content"
-                            android:text="@string/restart_required"
-                            android:textSize="11sp"
-                            android:textStyle="italic"
-                            android:textColor="#757575"
+                            android:text="@string/max_sse_clients_label"
+                            android:textSize="13sp"
+                            />
+
+                        <Spinner
+                            android:id="@+id/maxSseClientsSpinner"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:minHeight="48dp"
+                            android:layout_marginBottom="8dp"/>
+
+                        <TextView
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:text="@string/max_rtsp_sessions_label"
+                            android:textSize="13sp"
+                            />
+
+                        <Spinner
+                            android:id="@+id/maxRtspSessionsSpinner"
+                            android:layout_width="match_parent"
+                            android:layout_height="wrap_content"
+                            android:minHeight="48dp"
                             android:layout_marginBottom="12dp"/>
 
                         <!-- Auto-start -->

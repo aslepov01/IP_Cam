@@ -243,7 +243,7 @@
                         <div class="card">
                             <h3>Active Connections</h3>
                             <p style="color: #666; font-size: 14px; margin-bottom: 12px;">
-                                Shows active streaming and real-time event connections. Short-lived HTTP requests (status, snapshot, etc.) are not displayed.
+                                Shows active MJPEG streams, SSE clients, and RTSP sessions. Short-lived HTTP requests (status, snapshot, etc.) are not displayed.
                             </p>
                             <div id="connectionsContainer">
                                 <p>Loading connections...</p>
@@ -252,10 +252,12 @@
                         </div>
                         
                         <div class="card">
-                            <h3>Server Configuration</h3>
+                            <h3>Connection Limits</h3>
                             <div class="form-row">
-                                <label for="maxConnectionsSelect">Max Connections:</label>
-                                <select id="maxConnectionsSelect">
+                                <label for="maxMjpegStreamsSelect">MJPEG Streams:</label>
+                                <select id="maxMjpegStreamsSelect">
+                                    <option value="1">1</option>
+                                    <option value="2">2</option>
                                     <option value="4">4</option>
                                     <option value="8">8</option>
                                     <option value="16">16</option>
@@ -263,9 +265,35 @@
                                     <option value="64">64</option>
                                     <option value="100">100</option>
                                 </select>
-                                <button onclick="applyMaxConnections()">Apply</button>
                             </div>
-                            <div class="alert info">Server restart required for max connections change to take effect.</div>
+                            <div class="form-row">
+                                <label for="maxSseClientsSelect">SSE Clients:</label>
+                                <select id="maxSseClientsSelect">
+                                    <option value="1">1</option>
+                                    <option value="2">2</option>
+                                    <option value="4">4</option>
+                                    <option value="8">8</option>
+                                    <option value="16" selected>16</option>
+                                    <option value="32">32</option>
+                                    <option value="64">64</option>
+                                    <option value="100">100</option>
+                                </select>
+                            </div>
+                            <div class="form-row">
+                                <label for="maxRtspSessionsSelect">RTSP Sessions:</label>
+                                <select id="maxRtspSessionsSelect">
+                                    <option value="1">1</option>
+                                    <option value="2">2</option>
+                                    <option value="4">4</option>
+                                    <option value="8" selected>8</option>
+                                    <option value="16">16</option>
+                                    <option value="32">32</option>
+                                    <option value="64">64</option>
+                                    <option value="100">100</option>
+                                </select>
+                                <button onclick="applyConnectionLimits()">Apply</button>
+                            </div>
+                            <div class="alert info">Limits apply immediately. MJPEG allows one active stream per source IP internally. RTSP session cap is enforced on PLAYING sessions, not raw TCP accepts.</div>
                         </div>
                         
                         <div class="card">
@@ -449,8 +477,8 @@
                                 Close a specific connection by ID
                             </div>
                             <div class="endpoint">
-                                <strong>Set Max Connections:</strong> <code>GET /setMaxConnections?value=&lt;number&gt;</code><br>
-                                Set maximum number of simultaneous connections (4-100), requires server restart
+                                <strong>Set Connection Limits:</strong> <code>GET /setConnectionLimits?mjpegStreams=&lt;n&gt;&amp;sseClients=&lt;n&gt;&amp;rtspSessions=&lt;n&gt;</code><br>
+                                Update MJPEG, SSE, and RTSP limits without restarting the server
                             </div>
                             <div class="endpoint">
                                 <strong>Restart Server:</strong> <a href="/restart" target="_blank"><code>GET /restart</code></a><br>

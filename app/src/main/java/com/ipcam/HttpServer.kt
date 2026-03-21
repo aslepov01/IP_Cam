@@ -55,14 +55,7 @@ class HttpServer(
         private const val TAG = "HttpServer"
         /** Path of the log endpoint used in error responses and links. */
         private const val LOGS_PATH = "/logs"
-
-        /**
-         * Compute the maximum number of concurrent /stream connections allowed from a
-         * single IP, derived from the global connection cap.  The formula—one quarter of
-         * the global limit, minimum 1—keeps per-IP usage proportional as the global limit
-         * is scaled between 4 and 100 (yielding a per-IP range of 1 to 25).
-         */
-        fun maxStreamsPerIp(maxConnections: Int): Int = maxOf(1, maxConnections / 4)
+        private const val MAX_MJPEG_STREAMS_PER_IP = 1
     }
     
     /**
@@ -70,34 +63,36 @@ class HttpServer(
      */
     private data class SSEClient(
         val id: Long,
+        val remoteAddr: String,
+        val startTime: Long,
         val channel: ByteWriteChannel,
-        @Volatile var active: Boolean = true
+        @Volatile var active: Boolean = true,
+        @Volatile var responseJob: Job? = null
     )
 
     /**
      * Represents an active MJPEG stream connection.
      * Stored in [streamClients] keyed by [id]. Per-IP tracking is maintained separately
-     * in [streamClientsByIp] so multiple streams from the same IP are allowed up to
-     * [maxStreamsPerIp] (derived as a quarter of the global connection limit).
+     * in [streamClientByIp] so a reconnecting client from the same IP can replace the
+     * older stream immediately.
      */
     private data class StreamClient(
         val id: Long,
         val remoteAddr: String,
         val startTime: Long = System.currentTimeMillis(),
-        @Volatile var cancelled: Boolean = false
+        @Volatile var cancelled: Boolean = false,
+        @Volatile var channel: ByteWriteChannel? = null,
+        @Volatile var responseJob: Job? = null
     )
 
     /** All active MJPEG stream clients, keyed by unique client ID. */
     private val streamClients = ConcurrentHashMap<Long, StreamClient>()
 
     /**
-     * Per-IP ordered list of active client IDs (oldest first) used to enforce the
-     * per-IP stream limit. All accesses are guarded by [streamClientsByIpLock].
-     * HashMap is intentionally used (not ConcurrentHashMap) because every access is
-     * wrapped in `synchronized(streamClientsByIpLock)`, so no additional internal
-     * synchronization from ConcurrentHashMap is needed.
+     * Active MJPEG client ID by remote IP. The HTTP /stream endpoint intentionally allows
+     * only one live connection per IP; a newer connection replaces the older one.
      */
-    private val streamClientsByIp = HashMap<String, ArrayDeque<Long>>()
+    private val streamClientByIp = HashMap<String, Long>()
     private val streamClientsByIpLock = Any()
     
     /**
@@ -171,7 +166,7 @@ class HttpServer(
                 get("/setRtspFps") { serveSetRtspFps() }
                 
                 // Server configuration
-                get("/setMaxConnections") { serveSetMaxConnections() }
+                get("/setConnectionLimits") { serveSetConnectionLimits() }
                 get("/restart") { serveRestartServer() }
                 
                 // Adaptive quality control
@@ -224,21 +219,24 @@ class HttpServer(
         server = null
         
         // Clean up stream clients
-        streamClients.values.forEach { it.cancelled = true }
+        streamClients.values.forEach { terminateStreamClient(it, "server stop") }
         streamClients.clear()
+        activeStreams.set(0)
+        activeSnapshots.set(0)
         synchronized(streamClientsByIpLock) {
-            streamClientsByIp.clear()
+            streamClientByIp.clear()
         }
         
         // Clean up SSE clients
         synchronized(sseClientsLock) {
-            sseClients.forEach { it.active = false }
+            sseClients.forEach { terminateSseClient(it, "server stop") }
             sseClients.clear()
         }
         
         // Cancel any running update operations
         serverScope.cancel()
         
+        cameraService.onLongLivedConnectionsChanged()
         Log.d(TAG, "Ktor server stopped")
     }
     
@@ -256,8 +254,87 @@ class HttpServer(
      * Get the count of active SSE clients
      */
     fun getActiveSseClientsCount(): Int = synchronized(sseClientsLock) { sseClients.size }
-    
+
+    fun getConnectionSnapshots(): List<ConnectionSnapshot> {
+        val snapshots = mutableListOf<ConnectionSnapshot>()
+
+        streamClients.values.forEach { client ->
+            if (!client.cancelled) {
+                snapshots.add(
+                    ConnectionSnapshot(
+                        id = "mjpeg:${client.id}",
+                        kind = ConnectionKind.MJPEG,
+                        state = "STREAMING",
+                        remoteAddr = client.remoteAddr,
+                        endpoint = "/stream",
+                        startTimeMs = client.startTime
+                    )
+                )
+            }
+        }
+
+        synchronized(sseClientsLock) {
+            sseClients.forEach { client ->
+                snapshots.add(
+                    ConnectionSnapshot(
+                        id = "sse:${client.id}",
+                        kind = ConnectionKind.SSE,
+                        state = if (client.active) "CONNECTED" else "CLOSING",
+                        remoteAddr = client.remoteAddr,
+                        endpoint = "/events",
+                        startTimeMs = client.startTime,
+                        active = client.active
+                    )
+                )
+            }
+        }
+
+        return snapshots.sortedBy { it.startTimeMs }
+    }
+
+    fun closeConnection(connectionId: String): Boolean {
+        if (connectionId.startsWith("mjpeg:")) {
+            val id = connectionId.removePrefix("mjpeg:").toLongOrNull() ?: return false
+            val client = streamClients[id] ?: return false
+            return terminateStreamClient(client, "manual close")
+        }
+
+        if (connectionId.startsWith("sse:")) {
+            val id = connectionId.removePrefix("sse:").toLongOrNull() ?: return false
+            synchronized(sseClientsLock) {
+                val client = sseClients.find { it.id == id } ?: return false
+                sseClients.remove(client)
+                return terminateSseClient(client, "manual close")
+            }
+        }
+
+        return false
+    }
+
+    private fun terminateStreamClient(client: StreamClient, reason: String): Boolean {
+        if (client.cancelled) {
+            return false
+        }
+
+        client.cancelled = true
+        runCatching { client.responseJob?.cancel() }
+        runCatching { client.channel?.close() }
+        return true
+    }
+
+    private fun terminateSseClient(client: SSEClient, reason: String): Boolean {
+        if (!client.active) {
+            return false
+        }
+
+        client.active = false
+        runCatching { client.responseJob?.cancel() }
+        runCatching { client.channel.close() }
+        return true
+    }
+
     private fun broadcastSseMessage(message: String) {
+        var removedClient = false
         synchronized(sseClientsLock) {
             val iterator = sseClients.iterator()
             while (iterator.hasNext()) {
@@ -272,17 +349,23 @@ class HttpServer(
                         }
                     } catch (e: TimeoutCancellationException) {
                         Log.d(TAG, "SSE client ${client.id} write timeout")
-                        client.active = false
+                        terminateSseClient(client, "SSE write timeout")
                         iterator.remove()
+                        removedClient = true
                     } catch (e: Exception) {
                         Log.d(TAG, "SSE client ${client.id} disconnected: ${e.message}")
-                        client.active = false
+                        terminateSseClient(client, "SSE write failed")
                         iterator.remove()
+                        removedClient = true
                     }
                 } else {
                     iterator.remove()
+                    removedClient = true
                 }
             }
+        }
+        if (removedClient) {
+            cameraService.onLongLivedConnectionsChanged()
         }
     }
     
@@ -326,13 +409,21 @@ class HttpServer(
         }
         return result
     }
+
+    private fun escapeJson(value: String): String {
+        return value
+            .replace("\\", "\\\\")
+            .replace("\"", "\\\"")
+            .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
+    }
     
     // ==================== Route Handlers ====================
     
     private suspend fun PipelineContext<Unit, ApplicationCall>.serveIndexPage() {
         val activeConns = cameraService.getActiveConnectionsCount()
-        val maxConns = cameraService.getMaxConnections()
-        val connectionDisplay = "$activeConns/$maxConns"
+        val connectionDisplay = if (activeConns == 1) "1 active" else "$activeConns active"
         val deviceName = cameraService.getDeviceName()
         val displayName = if (deviceName.isNotEmpty()) deviceName else "IP Camera Server"
         val adbInfo = (cameraService as? CameraService)?.getADBConnectionInfo() ?: ""
@@ -515,54 +606,53 @@ class HttpServer(
 
         // Atomically reserve a slot before touching any other state.
         // Incrementing first avoids the TOCTOU race of a separate get() + incrementAndGet() pair.
-        val maxConns = cameraService.getMaxConnections()
-        val maxPerIp = maxStreamsPerIp(maxConns)  // derived as maxConns / 4, min 1
+        val maxMjpegStreams = cameraService.getConnectionLimits().maxMjpegStreams
         val streamCount = activeStreams.incrementAndGet()
-        if (streamCount > maxConns) {
+        if (streamCount > maxMjpegStreams) {
             // Rather than rejecting the new client with 503, evict the globally oldest active
             // stream so that reconnecting clients (or NVR systems that reopen streams) are never
             // stuck waiting for a slot.  The evicted stream's finally-block will decrement
-            // activeStreams, bringing the count back to maxConns.
+            // activeStreams, bringing the count back to maxMjpegStreams.
             val globallyOldest = streamClients.values
                 .filter { !it.cancelled }
                 .minByOrNull { it.startTime }
             if (globallyOldest != null) {
                 Log.w(
                     TAG,
-                    "Max connections ($maxConns) reached, evicting oldest stream " +
+                    "MJPEG limit ($maxMjpegStreams) reached, evicting oldest stream " +
                     "id=${globallyOldest.id} (IP: ${globallyOldest.remoteAddr}) " +
                     "to accept new client from $clientIp"
                 )
-                globallyOldest.cancelled = true
+                terminateStreamClient(globallyOldest, "global MJPEG limit reached")
             } else {
                 // All existing streams are already in the process of being cancelled; the count
                 // will normalise as their finally-blocks run.  Log and continue.
                 Log.d(
                     TAG,
-                    "Max connections ($maxConns) temporarily exceeded (count: $streamCount); " +
+                    "MJPEG limit ($maxMjpegStreams) temporarily exceeded (count: $streamCount); " +
                     "all excess streams are already being cancelled"
                 )
             }
         }
 
-        // Register this client and enforce the per-IP limit.
-        // If the IP already has maxPerIp active streams, cancel the oldest one so that
-        // reconnecting clients never accumulate stale coroutines beyond the limit.
+        // Allow only one MJPEG stream per IP. A newer connection replaces the older one so
+        // reconnecting browsers and NVRs do not accumulate stale streams on the same host.
         val newClient = StreamClient(clientId, clientIp)
         streamClients[clientId] = newClient
-        var oldestClientToCancel: StreamClient? = null
+        var previousClientFromSameIp: StreamClient? = null
         synchronized(streamClientsByIpLock) {
-            val ipQueue = streamClientsByIp.getOrPut(clientIp) { ArrayDeque() }
-            if (ipQueue.size >= maxPerIp) {
-                // Remove the oldest client ID and look up its StreamClient for cancellation
-                val oldestId = ipQueue.removeFirst()
-                oldestClientToCancel = streamClients[oldestId]
+            val previousClientId = streamClientByIp.put(clientIp, clientId)
+            if (previousClientId != null && previousClientId != clientId) {
+                previousClientFromSameIp = streamClients[previousClientId]
             }
-            ipQueue.addLast(clientId)
         }
-        oldestClientToCancel?.let { oldest ->
-            Log.d(TAG, "Per-IP limit ($maxPerIp) reached for $clientIp, cancelling oldest stream id=${oldest.id}")
-            oldest.cancelled = true
+        previousClientFromSameIp?.let { previous ->
+            Log.d(
+                TAG,
+                "MJPEG per-IP limit ($MAX_MJPEG_STREAMS_PER_IP) reached for $clientIp, " +
+                    "evicting previous stream id=${previous.id}"
+            )
+            terminateStreamClient(previous, "MJPEG per-IP replacement")
         }
 
         val isFirstStream = streamCount == 1
@@ -574,8 +664,12 @@ class HttpServer(
         }
         
         Log.d(TAG, "Stream connection opened. Client $clientId (IP: $clientIp). Active streams: $streamCount")
+        cameraService.onLongLivedConnectionsChanged()
         
+        call.response.header(HttpHeaders.Connection, "close")
         call.respondBytesWriter(ContentType.parse("multipart/x-mixed-replace; boundary=--jpgboundary")) {
+            newClient.channel = this
+            newClient.responseJob = currentCoroutineContext()[Job]
             try {
                 while (isActive && !newClient.cancelled) {
                     // Check if streaming is still allowed (battery might have dropped during stream)
@@ -623,15 +717,17 @@ class HttpServer(
                 }
             } finally {
                 // Remove this client from both tracking structures
-                streamClients.remove(clientId)
+                val removedClient = streamClients.remove(clientId)
                 synchronized(streamClientsByIpLock) {
-                    val ipQueue = streamClientsByIp[clientIp]
-                    if (ipQueue != null) {
-                        ipQueue.remove(clientId)
-                        if (ipQueue.isEmpty()) streamClientsByIp.remove(clientIp)
+                    if (streamClientByIp[clientIp] == clientId) {
+                        streamClientByIp.remove(clientIp)
                     }
                 }
-                val remainingStreams = activeStreams.decrementAndGet()
+                val remainingStreams = if (removedClient != null) {
+                    activeStreams.decrementAndGet().coerceAtLeast(0)
+                } else {
+                    activeStreams.get()
+                }
                 Log.d(TAG, "Stream connection closed. Client $clientId (IP: $clientIp). Active streams: $remainingStreams")
                 
                 // Unregister MJPEG consumer when last stream disconnects
@@ -639,6 +735,7 @@ class HttpServer(
                     Log.d(TAG, "Last MJPEG stream disconnected, unregistering consumer...")
                     cameraService.unregisterMjpegConsumer()
                 }
+                cameraService.onLongLivedConnectionsChanged()
             }
         }
     }
@@ -661,16 +758,24 @@ class HttpServer(
     
     private suspend fun PipelineContext<Unit, ApplicationCall>.serveStatus() {
         val cameraName = if (cameraService.getCurrentCamera() == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"
-        val activeConns = cameraService.getActiveConnectionsCount()
-        val maxConns = cameraService.getMaxConnections()
+        val limits = cameraService.getConnectionLimits()
         val activeStreamCount = activeStreams.get()
         val sseCount = synchronized(sseClientsLock) { sseClients.size }
+        val rtspMetrics = cameraService.getRTSPMetrics()
+        val rtspActiveSessions = rtspMetrics?.activeSessions ?: 0
+        val rtspPlayingSessions = rtspMetrics?.playingSessions ?: 0
+        val activeLongLivedConnections = activeStreamCount + sseCount + rtspActiveSessions
+        val connectionDisplay = if (activeLongLivedConnections == 1) {
+            "1 active"
+        } else {
+            "$activeLongLivedConnections active"
+        }
         val batteryMode = cameraService.getBatteryMode()
         val streamingAllowed = cameraService.isStreamingAllowed()
         val deviceName = cameraService.getDeviceName()
         val cameraState = cameraService.getCameraStateString()
         
-        val endpoints = "[\"/\", \"/snapshot\", \"/stream\", \"/switch\", \"/status\", \"/metrics\", \"/events\", \"/toggleFlashlight\", \"/flashOn\", \"/flashOff\", \"/formats\", \"/connections\", \"/stats\", \"/overrideBatteryLimit\", \"/cameraState\", \"/activateCamera\", \"/deactivateCamera\", \"/checkUpdate\", \"/triggerUpdate\", \"/reboot\"]"
+        val endpoints = "[\"/\", \"/snapshot\", \"/stream\", \"/switch\", \"/status\", \"/metrics\", \"/events\", \"/toggleFlashlight\", \"/flashOn\", \"/flashOff\", \"/formats\", \"/connections\", \"/stats\", \"/overrideBatteryLimit\", \"/cameraState\", \"/activateCamera\", \"/deactivateCamera\", \"/checkUpdate\", \"/triggerUpdate\", \"/reboot\", \"/setConnectionLimits\"]"
         
         val json = """
             {
@@ -683,12 +788,19 @@ class HttpServer(
                 "resolution": "${cameraService.getSelectedResolutionLabel()}",
                 "flashlightAvailable": ${cameraService.isFlashlightAvailable()},
                 "flashlightOn": ${cameraService.isFlashlightEnabled()},
-                "activeConnections": $activeConns,
-                "maxConnections": $maxConns,
-                "connections": "$activeConns/$maxConns",
-                "maxStreamsPerIp": ${maxStreamsPerIp(maxConns)},
-                "activeStreams": $activeStreamCount,
-                "activeSSEClients": $sseCount,
+                "connectionDisplay": "$connectionDisplay",
+                "activeConnections": {
+                    "total": $activeLongLivedConnections,
+                    "mjpeg": $activeStreamCount,
+                    "sse": $sseCount,
+                    "rtspActive": $rtspActiveSessions,
+                    "rtspPlaying": $rtspPlayingSessions
+                },
+                "connectionLimits": {
+                    "maxMjpegStreams": ${limits.maxMjpegStreams},
+                    "maxSseClients": ${limits.maxSseClients},
+                    "maxRtspSessions": ${limits.maxRtspSessions}
+                },
                 "batteryMode": "$batteryMode",
                 "streamingAllowed": $streamingAllowed,
                 "endpoints": $endpoints,
@@ -711,15 +823,37 @@ class HttpServer(
     }
     
     private suspend fun PipelineContext<Unit, ApplicationCall>.serveSSE() {
-        val clientId = System.currentTimeMillis()
+        val clientId = clientIdCounter.incrementAndGet()
+        val clientRemoteAddr = call.request.local.remoteAddress.ifBlank { "unknown-$clientId" }
+        val startTime = System.currentTimeMillis()
         Log.d(TAG, "SSE client $clientId connected")
         
+        call.response.header(HttpHeaders.Connection, "close")
         call.respondBytesWriter(ContentType.Text.EventStream) {
-            val client = SSEClient(clientId, this)
+            val client = SSEClient(clientId, clientRemoteAddr, startTime, this)
+            client.responseJob = currentCoroutineContext()[Job]
+            var evictedClient: SSEClient? = null
             
             synchronized(sseClientsLock) {
+                val maxSseClients = cameraService.getConnectionLimits().maxSseClients
+                if (sseClients.size >= maxSseClients) {
+                    evictedClient = sseClients.minByOrNull { it.startTime }
+                    if (evictedClient != null) {
+                        sseClients.remove(evictedClient)
+                        terminateSseClient(evictedClient!!, "SSE limit reached")
+                    }
+                }
                 sseClients.add(client)
             }
+
+            evictedClient?.let { evicted ->
+                Log.w(
+                    TAG,
+                    "SSE limit (${cameraService.getConnectionLimits().maxSseClients}) reached, evicting oldest client " +
+                        "id=${evicted.id} (${evicted.remoteAddr}) to accept $clientId"
+                )
+            }
+            cameraService.onLongLivedConnectionsChanged()
             
             try {
                 // Send initial camera state (full state for new clients)
@@ -749,47 +883,26 @@ class HttpServer(
                     sseClients.remove(client)
                 }
                 Log.d(TAG, "SSE client $clientId closed. Remaining SSE clients: ${sseClients.size}")
+                cameraService.onLongLivedConnectionsChanged()
             }
         }
     }
     
     private suspend fun PipelineContext<Unit, ApplicationCall>.serveConnections() {
-        val jsonArray = mutableListOf<String>()
-        
-        // Add active streaming connections with real per-client metadata
-        streamClients.values.forEach { client ->
-            if (!client.cancelled) {
-                jsonArray.add("""
-                {
-                    "id": ${client.id},
-                    "remoteAddr": "${client.remoteAddr}",
-                    "endpoint": "/stream",
-                    "startTime": ${client.startTime},
-                    "duration": ${System.currentTimeMillis() - client.startTime},
-                    "active": true,
-                    "type": "stream"
-                }
-                """.trimIndent())
-            }
+        val now = System.currentTimeMillis()
+        val jsonArray = cameraService.getConnectionSnapshots().map { connection ->
+            """{
+                "id":"${escapeJson(connection.id)}",
+                "remoteAddr":"${escapeJson(connection.remoteAddr)}",
+                "endpoint":"${escapeJson(connection.endpoint)}",
+                "startTime":${connection.startTimeMs},
+                "duration":${(now - connection.startTimeMs).coerceAtLeast(0L)},
+                "active":${connection.active},
+                "kind":"${connection.kind.name.lowercase()}",
+                "state":"${escapeJson(connection.state)}"
+            }""".trimIndent()
         }
-        
-        // Add SSE clients
-        synchronized(sseClientsLock) {
-            sseClients.forEachIndexed { index, client ->
-                jsonArray.add("""
-                {
-                    "id": ${client.id},
-                    "remoteAddr": "Real-time Events Connection ${index + 1}",
-                    "endpoint": "/events",
-                    "startTime": ${client.id},
-                    "duration": ${System.currentTimeMillis() - client.id},
-                    "active": ${client.active},
-                    "type": "sse"
-                }
-                """.trimIndent())
-            }
-        }
-        
+
         val json = """{"connections": [${jsonArray.joinToString(",")}]}"""
         call.respondText(json, ContentType.Application.Json)
     }
@@ -806,35 +919,16 @@ class HttpServer(
             return
         }
         
-        val id = idStr.toLongOrNull()
-        if (id == null) {
-            call.respondText(
-                """{"status":"error","message":"Invalid id parameter"}""",
-                ContentType.Application.Json,
-                HttpStatusCode.BadRequest
-            )
-            return
-        }
-        
-        // Try to close SSE client with this ID
-        var closed = false
-        synchronized(sseClientsLock) {
-            val client = sseClients.find { it.id == id }
-            if (client != null) {
-                client.active = false
-                sseClients.remove(client)
-                closed = true
-            }
-        }
-        
+        val closed = cameraService.closeConnection(idStr)
+
         if (closed) {
             call.respondText(
-                """{"status":"ok","message":"Connection closed","id":$id}""",
+                """{"status":"ok","message":"Connection closed","id":"${escapeJson(idStr)}"}""",
                 ContentType.Application.Json
             )
         } else {
             call.respondText(
-                """{"status":"info","message":"Connection not found or cannot be closed. Only SSE connections can be manually closed.","id":$id}""",
+                """{"status":"info","message":"Connection not found or already closing","id":"${escapeJson(idStr)}"}""",
                 ContentType.Application.Json
             )
         }
@@ -1109,40 +1203,43 @@ class HttpServer(
         )
     }
     
-    private suspend fun PipelineContext<Unit, ApplicationCall>.serveSetMaxConnections() {
-        val valueStr = call.parameters["value"]
-        
-        if (valueStr == null) {
+    private suspend fun PipelineContext<Unit, ApplicationCall>.serveSetConnectionLimits() {
+        fun parseLimitParam(name: String, currentValue: Int): Int? {
+            val rawValue = call.parameters[name] ?: return currentValue
+            return rawValue.toIntOrNull()
+        }
+
+        val currentLimits = cameraService.getConnectionLimits()
+        val newMjpegStreams = parseLimitParam("mjpegStreams", currentLimits.maxMjpegStreams)
+        val newSseClients = parseLimitParam("sseClients", currentLimits.maxSseClients)
+        val newRtspSessions = parseLimitParam("rtspSessions", currentLimits.maxRtspSessions)
+
+        if (newMjpegStreams == null || newSseClients == null || newRtspSessions == null) {
             call.respondText(
-                """{"status":"error","message":"Missing value parameter"}""",
+                """{"status":"error","message":"Connection limits must be integers"}""",
                 ContentType.Application.Json,
                 HttpStatusCode.BadRequest
             )
             return
         }
-        
-        val newMax = valueStr.toIntOrNull()
-        if (newMax == null || newMax < 4 || newMax > 100) {
-            call.respondText(
-                """{"status":"error","message":"Max connections must be between 4 and 100"}""",
-                ContentType.Application.Json,
-                HttpStatusCode.BadRequest
-            )
-            return
-        }
-        
-        val changed = cameraService.setMaxConnections(newMax)
-        if (changed) {
-            call.respondText(
-                """{"status":"ok","message":"Max connections set to $newMax. Server restart required for changes to take effect.","maxConnections":$newMax,"requiresRestart":true}""",
-                ContentType.Application.Json
-            )
+
+        val updatedLimits = ConnectionLimits(
+            maxMjpegStreams = newMjpegStreams,
+            maxSseClients = newSseClients,
+            maxRtspSessions = newRtspSessions
+        ).normalized()
+
+        val changed = cameraService.updateConnectionLimits(updatedLimits)
+        val message = if (changed) {
+            "Connection limits updated"
         } else {
-            call.respondText(
-                """{"status":"ok","message":"Max connections already set to $newMax","maxConnections":$newMax,"requiresRestart":false}""",
-                ContentType.Application.Json
-            )
+            "Connection limits unchanged"
         }
+
+        call.respondText(
+            """{"status":"ok","message":"$message","connectionLimits":{"maxMjpegStreams":${updatedLimits.maxMjpegStreams},"maxSseClients":${updatedLimits.maxSseClients},"maxRtspSessions":${updatedLimits.maxRtspSessions}}}""",
+            ContentType.Application.Json
+        )
     }
     
     private suspend fun PipelineContext<Unit, ApplicationCall>.serveToggleFlashlight() {
