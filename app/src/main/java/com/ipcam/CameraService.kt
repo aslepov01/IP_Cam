@@ -1,6 +1,7 @@
 package com.ipcam
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -18,6 +19,7 @@ import android.graphics.Color
 import android.graphics.Paint
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.Image
@@ -30,10 +32,11 @@ import android.os.PowerManager
 import android.util.Log
 import android.util.Size
 import android.view.OrientationEventListener
-import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.core.CameraSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -57,6 +60,7 @@ import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import java.security.MessageDigest
 
 /**
  * CameraService - Single Source of Truth for Camera Operations
@@ -82,7 +86,7 @@ import java.util.concurrent.atomic.AtomicReference
  *   3. onConnectionsChangedCallback: Updates connection counts
  * 
  * - Callbacks are @Volatile to ensure visibility across threads
- * - clearCallbacks() MUST be called in MainActivity.onDestroy() to prevent memory leaks
+ * - Activity callbacks are owner-scoped so a stale Activity instance cannot clear a newer one
  * - All callback invocations use safe wrappers (safeInvokeXxxCallback) that:
  *   * Check service lifecycle state (skip if DESTROYED)
  *   * Handle null callbacks gracefully
@@ -179,7 +183,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     
     private val binder = LocalBinder()
     @Volatile private var httpServer: HttpServer? = null
-    private var currentCamera = CameraSelector.DEFAULT_BACK_CAMERA
+    @Volatile private var selectedCameraId: String? = null
     
     // Track if service is stopping due to missing permissions or other fatal errors
     @Volatile private var isStopping = false
@@ -208,7 +212,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     
     // MJPEG frame throttling
     @Volatile private var lastMjpegFrameProcessedTimeMs: Long = 0
-    private val resolutionCache = mutableMapOf<Int, List<Size>>()
+    private val resolutionByCameraId = mutableMapOf<String, Size>()
     
     /**
      * CachedCameraCharacteristics - Stores hardware capabilities for a camera
@@ -219,25 +223,615 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      */
     private data class CachedCameraCharacteristics(
         val cameraId: String,
+        val ordinal: Int,
         val lensFacing: Int, // CameraCharacteristics.LENS_FACING_BACK or LENS_FACING_FRONT
         val hasFlash: Boolean,
-        val supportedResolutions: List<Size> // All supported YUV_420_888 output sizes
+        val yuvOutputResolutions: List<Size>,
+        val previewOutputResolutions: List<Size>,
+        val supportedResolutions: List<Size>,
+        val hardwareFingerprint: String
     )
+
+    private data class RawCameraGroup(
+        val groupKey: String,
+        val fingerprint: String,
+        val lensFacing: Int,
+        val candidates: List<CachedCameraCharacteristics>
+    )
+
+private enum class CameraCandidateState {
+    UNKNOWN,
+    WORKING,
+    BROKEN
+}
+
+private enum class TorchCapabilityState {
+    UNKNOWN,
+    AVAILABLE,
+    UNAVAILABLE
+}
+
+private enum class TorchVerificationResult {
+    AVAILABLE,
+    UNAVAILABLE,
+    INCONCLUSIVE
+}
     
     // Cache camera characteristics to avoid repeated IPC calls
     // Key: camera ID, Value: cached characteristics
     private val cameraCharacteristicsCache = mutableMapOf<String, CachedCameraCharacteristics>()
     @Volatile private var cameraCharacteristicsCacheInitialized = false
+    private val cameraCatalogLock = Any()
+    private var cameraGroups = emptyList<RawCameraGroup>()
+    private val cameraGroupKeyByRawId = mutableMapOf<String, String>()
+    private val representativeCameraIdByGroupKey = mutableMapOf<String, String>()
+    private val cameraCandidateStateById = mutableMapOf<String, CameraCandidateState>()
+    private val torchCapabilityByGroupKey = mutableMapOf<String, TorchCapabilityState>()
+    @Volatile private var cameraCatalogVersion = 0
+    private var lastPublishedCameraCatalogSignature = emptyList<String>()
+    private var torchVerificationJob: Job? = null
+    private var boundCameraStartupTimeoutJob: Job? = null
+    @Volatile private var boundCameraGroupKey: String? = null
+    @Volatile private var boundCameraId: String? = null
+    @Volatile private var awaitingFirstFrameForBoundCamera: Boolean = false
+    @Volatile private var lastKnownGoodCameraId: String? = null
+    @Volatile private var desiredTorchEnabled: Boolean = false
+    @Volatile private var effectiveTorchEnabled: Boolean = false
+    @Volatile private var effectiveTorchOwnerCameraId: String? = null
+
+    private fun lensFacingToLabel(lensFacing: Int): String {
+        return when (lensFacing) {
+            CameraCharacteristics.LENS_FACING_FRONT -> "front"
+            CameraCharacteristics.LENS_FACING_BACK -> "back"
+            CameraCharacteristics.LENS_FACING_EXTERNAL -> "external"
+            else -> "unknown"
+        }
+    }
+
+    private fun lensFacingDisplayName(lensFacing: Int): String {
+        return when (lensFacing) {
+            CameraCharacteristics.LENS_FACING_FRONT -> "Front"
+            CameraCharacteristics.LENS_FACING_BACK -> "Back"
+            CameraCharacteristics.LENS_FACING_EXTERNAL -> "External"
+            else -> "Camera"
+        }
+    }
+
+    private fun cameraFacingPriority(lensFacing: Int): Int {
+        return when (lensFacing) {
+            CameraCharacteristics.LENS_FACING_BACK -> 0
+            CameraCharacteristics.LENS_FACING_FRONT -> 1
+            CameraCharacteristics.LENS_FACING_EXTERNAL -> 2
+            else -> 3
+        }
+    }
+
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun getBindableCameraIds(): Set<String>? {
+        val provider = cameraProvider ?: return null
+        return provider.availableCameraInfos.mapNotNull { cameraInfo ->
+            runCatching { Camera2CameraInfo.from(cameraInfo).cameraId }.getOrNull()
+        }.toSet()
+    }
+
+    private fun getBindableCameraDescriptors(): List<CachedCameraCharacteristics> {
+        val bindableIds = getBindableCameraIds()
+        return cameraCharacteristicsCache.values
+            .asSequence()
+            .filter { bindableIds == null || it.cameraId in bindableIds }
+            .sortedWith(
+                compareBy<CachedCameraCharacteristics>(
+                    { cameraFacingPriority(it.lensFacing) },
+                    { it.ordinal }
+                )
+            )
+            .toList()
+    }
+
+    private fun buildCameraOptions(): List<CameraOption> {
+        val groups = getVisibleCameraGroups()
+        val groupSizes = groups.groupingBy { it.lensFacing }.eachCount()
+        val groupIndexes = mutableMapOf<Int, Int>()
+
+        return groups.map { group ->
+            val descriptor = getRepresentativeCameraDescriptor(group) ?: group.candidates.first()
+            val index = groupIndexes.getOrDefault(descriptor.lensFacing, 0) + 1
+            groupIndexes[descriptor.lensFacing] = index
+            val baseLabel = lensFacingDisplayName(descriptor.lensFacing)
+            val displayName = if ((groupSizes[descriptor.lensFacing] ?: 0) > 1) {
+                "$baseLabel $index (ID ${descriptor.cameraId})"
+            } else {
+                "$baseLabel (ID ${descriptor.cameraId})"
+            }
+            CameraOption(
+                cameraId = descriptor.cameraId,
+                displayName = displayName,
+                facing = lensFacingToLabel(descriptor.lensFacing),
+                hasFlash = getTorchCapabilityState(group.groupKey) == TorchCapabilityState.AVAILABLE
+            )
+        }
+    }
+
+    private fun getDefaultCameraId(): String? {
+        return getVisibleCameraGroups().firstNotNullOfOrNull { getRepresentativeCameraDescriptor(it)?.cameraId }
+            ?: getBindableCameraDescriptors().firstOrNull()?.cameraId
+            ?: cameraCharacteristicsCache.values.minByOrNull { it.ordinal }?.cameraId
+    }
+
+    private fun getDefaultCameraIdForFacing(lensFacing: Int): String? {
+        val visibleMatch = getVisibleCameraGroups()
+            .filter { it.lensFacing == lensFacing }
+            .firstNotNullOfOrNull { getRepresentativeCameraDescriptor(it)?.cameraId }
+        if (visibleMatch != null) {
+            return visibleMatch
+        }
+
+        return getBindableCameraDescriptors()
+            .filter { it.lensFacing == lensFacing }
+            .minByOrNull { it.ordinal }
+            ?.cameraId
+    }
+
+    private fun getSelectedCameraDescriptor(): CachedCameraCharacteristics? {
+        val selectedId = ensureSelectedCameraId() ?: return null
+        return cameraCharacteristicsCache[selectedId]
+    }
+
+    private fun getCameraGroups(): List<RawCameraGroup> {
+        synchronized(cameraCatalogLock) {
+            return cameraGroups.toList()
+        }
+    }
+
+    private fun getVisibleCameraGroups(): List<RawCameraGroup> {
+        synchronized(cameraCatalogLock) {
+            return cameraGroups.filter { group ->
+                group.candidates.any { candidate ->
+                    cameraCandidateStateById[candidate.cameraId] != CameraCandidateState.BROKEN
+                }
+            }
+        }
+    }
+
+    private fun buildCameraGroupKey(fingerprint: String): String {
+        val digest = MessageDigest.getInstance("SHA-1").digest(fingerprint.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it) }.take(12)
+    }
+
+    private fun getTorchCapabilityState(groupKey: String?): TorchCapabilityState {
+        if (groupKey == null) {
+            return TorchCapabilityState.UNAVAILABLE
+        }
+        synchronized(cameraCatalogLock) {
+            return torchCapabilityByGroupKey[groupKey] ?: TorchCapabilityState.UNAVAILABLE
+        }
+    }
+
+    private fun isTorchAvailableForGroup(groupKey: String?): Boolean {
+        return getTorchCapabilityState(groupKey) == TorchCapabilityState.AVAILABLE
+    }
+
+    private fun getCameraGroupForRawId(cameraId: String?): RawCameraGroup? {
+        val resolvedGroupKey = synchronized(cameraCatalogLock) {
+            if (cameraId == null) {
+                null
+            } else {
+                cameraGroupKeyByRawId[cameraId]
+            }
+        } ?: return null
+
+        return getCameraGroups().firstOrNull { it.groupKey == resolvedGroupKey }
+    }
+
+    private fun getRepresentativeCameraDescriptor(group: RawCameraGroup): CachedCameraCharacteristics? {
+        val representativeId = synchronized(cameraCatalogLock) {
+            representativeCameraIdByGroupKey[group.groupKey]
+        }
+        return group.candidates.firstOrNull { it.cameraId == representativeId }
+            ?: group.candidates.firstOrNull()
+    }
+
+    private fun chooseRepresentativeCameraIdLocked(
+        group: RawCameraGroup,
+        preferredCameraId: String? = null
+    ): String {
+        fun candidateIfUsable(cameraId: String?): CachedCameraCharacteristics? {
+            if (cameraId == null) {
+                return null
+            }
+            return group.candidates.firstOrNull { it.cameraId == cameraId }
+                ?.takeIf { cameraCandidateStateById[it.cameraId] != CameraCandidateState.BROKEN }
+        }
+
+        candidateIfUsable(preferredCameraId)?.let { return it.cameraId }
+        candidateIfUsable(selectedCameraId)?.let { return it.cameraId }
+        candidateIfUsable(lastKnownGoodCameraId)?.let { return it.cameraId }
+
+        val rankedCandidates = group.candidates.sortedWith(
+            compareBy<CachedCameraCharacteristics>(
+                {
+                    when (cameraCandidateStateById[it.cameraId] ?: CameraCandidateState.UNKNOWN) {
+                        CameraCandidateState.WORKING -> 0
+                        CameraCandidateState.UNKNOWN -> 1
+                        CameraCandidateState.BROKEN -> 2
+                    }
+                },
+                { it.ordinal }
+            )
+        )
+        return rankedCandidates.first().cameraId
+    }
+
+    private fun publishCameraCatalogIfChanged(reason: String): Boolean {
+        val nextSignature = synchronized(cameraCatalogLock) {
+            cameraGroups.mapNotNull { group ->
+                val representative = getRepresentativeCameraDescriptor(group) ?: return@mapNotNull null
+                val candidateStates = group.candidates.joinToString(",") { candidate ->
+                    "${candidate.cameraId}:${cameraCandidateStateById[candidate.cameraId] ?: CameraCandidateState.UNKNOWN}"
+                }
+                "${group.groupKey}|${representative.cameraId}|${torchCapabilityByGroupKey[group.groupKey] ?: TorchCapabilityState.UNAVAILABLE}|$candidateStates"
+            }
+        }
+
+        if (nextSignature == lastPublishedCameraCatalogSignature) {
+            return false
+        }
+
+        lastPublishedCameraCatalogSignature = nextSignature
+        cameraCatalogVersion += 1
+        Log.i(TAG, "Camera catalog updated ($reason): ${buildCameraOptions().joinToString { "${it.displayName}[flash=${it.hasFlash}]" }}")
+        return true
+    }
+
+    private fun normalizeResolutionMappingsForCameraGroups(groups: List<RawCameraGroup>) {
+        groups.forEach { group ->
+            val representativeId = getRepresentativeCameraDescriptor(group)?.cameraId ?: return@forEach
+            if (resolutionByCameraId[representativeId] == null) {
+                val migratedResolution = group.candidates
+                    .asSequence()
+                    .mapNotNull { candidate -> resolutionByCameraId[candidate.cameraId] }
+                    .firstOrNull()
+                if (migratedResolution != null) {
+                    resolutionByCameraId[representativeId] = migratedResolution
+                }
+            }
+
+            group.candidates
+                .map { it.cameraId }
+                .filter { it != representativeId }
+                .forEach { aliasId -> resolutionByCameraId.remove(aliasId) }
+        }
+    }
+
+    private fun rebuildCameraCatalog(reason: String) {
+        if (!cameraCharacteristicsCacheInitialized) {
+            return
+        }
+
+        val groups = getBindableCameraDescriptors()
+            .groupBy { it.hardwareFingerprint }
+            .values
+            .map { candidates ->
+                val sortedCandidates = candidates.sortedBy { it.ordinal }
+                RawCameraGroup(
+                    groupKey = buildCameraGroupKey(sortedCandidates.first().hardwareFingerprint),
+                    fingerprint = sortedCandidates.first().hardwareFingerprint,
+                    lensFacing = sortedCandidates.first().lensFacing,
+                    candidates = sortedCandidates
+                )
+            }
+            .sortedWith(
+                compareBy<RawCameraGroup>(
+                    { cameraFacingPriority(it.lensFacing) },
+                    { it.candidates.first().ordinal }
+                )
+            )
+
+        synchronized(cameraCatalogLock) {
+            cameraGroups = groups
+            cameraGroupKeyByRawId.clear()
+            groups.forEach { group ->
+                group.candidates.forEach { candidate ->
+                    cameraGroupKeyByRawId[candidate.cameraId] = group.groupKey
+                    cameraCandidateStateById.putIfAbsent(candidate.cameraId, CameraCandidateState.UNKNOWN)
+                }
+            }
+
+            val validCameraIds = groups.flatMapTo(mutableSetOf()) { group -> group.candidates.map { it.cameraId } }
+            cameraCandidateStateById.keys.retainAll(validCameraIds)
+
+            val validGroupKeys = groups.mapTo(mutableSetOf()) { it.groupKey }
+            representativeCameraIdByGroupKey.keys.retainAll(validGroupKeys)
+            torchCapabilityByGroupKey.keys.retainAll(validGroupKeys)
+
+            groups.forEach { group ->
+                representativeCameraIdByGroupKey[group.groupKey] = chooseRepresentativeCameraIdLocked(
+                    group,
+                    preferredCameraId = representativeCameraIdByGroupKey[group.groupKey]
+                )
+                torchCapabilityByGroupKey[group.groupKey] = when {
+                    group.lensFacing != CameraCharacteristics.LENS_FACING_BACK -> TorchCapabilityState.UNAVAILABLE
+                    else -> torchCapabilityByGroupKey[group.groupKey] ?: TorchCapabilityState.UNKNOWN
+                }
+            }
+        }
+
+        normalizeResolutionMappingsForCameraGroups(groups)
+
+        val selectedId = ensureSelectedCameraId()
+        if (selectedId != null && selectedResolution == null) {
+            selectedResolution = resolutionByCameraId[selectedId]
+        }
+
+        val changed = publishCameraCatalogIfChanged(reason)
+        if (changed) {
+            saveSettings()
+        }
+        broadcastCameraState()
+        safeInvokeCameraStateCallback()
+    }
+
+    private fun resolveRepresentativeCameraId(cameraId: String?): String? {
+        if (cameraId == null) {
+            return null
+        }
+
+        synchronized(cameraCatalogLock) {
+            val groupKey = cameraGroupKeyByRawId[cameraId] ?: return if (cameraCharacteristicsCache.containsKey(cameraId)) cameraId else null
+            val group = cameraGroups.firstOrNull { it.groupKey == groupKey } ?: return null
+            val representativeId = representativeCameraIdByGroupKey[groupKey]
+                ?: chooseRepresentativeCameraIdLocked(group).also { representativeCameraIdByGroupKey[groupKey] = it }
+            return representativeId
+        }
+    }
+
+    private fun ensureSelectedCameraId(): String? {
+        val currentId = selectedCameraId
+        val resolvedCurrentId = resolveRepresentativeCameraId(currentId)
+        if (resolvedCurrentId != null) {
+            if (selectedCameraId != resolvedCurrentId) {
+                selectedCameraId = resolvedCurrentId
+                selectedResolution = resolutionByCameraId[resolvedCurrentId]
+            }
+            return resolvedCurrentId
+        }
+
+        val fallbackId = resolveRepresentativeCameraId(lastKnownGoodCameraId)
+            ?: getDefaultCameraId()
+        selectedCameraId = fallbackId
+        selectedResolution = fallbackId?.let { resolutionByCameraId[it] }
+        return fallbackId
+    }
+
+    @SuppressLint("UnsafeOptInUsageError")
+    private fun buildCameraSelector(cameraId: String): CameraSelector {
+        return CameraSelector.Builder()
+            .addCameraFilter { cameraInfos ->
+                cameraInfos.filter { cameraInfo ->
+                    runCatching { Camera2CameraInfo.from(cameraInfo).cameraId == cameraId }
+                        .getOrDefault(false)
+                }
+            }
+            .build()
+    }
+
+    private fun formatFloatKey(value: Float?): String {
+        return if (value == null) "unknown" else String.format(Locale.US, "%.3f", value)
+    }
+
+    private fun buildCameraFingerprint(
+        lensFacing: Int,
+        hasFlash: Boolean,
+        focalLengths: FloatArray?,
+        sensorPhysicalSize: android.util.SizeF?,
+        pixelArraySize: android.util.Size?,
+        capabilities: IntArray?,
+        supportedResolutions: List<Size>
+    ): String {
+        val focalLengthsKey = focalLengths
+            ?.sorted()
+            ?.joinToString("|") { formatFloatKey(it) }
+            ?: "none"
+        val physicalSizeKey = sensorPhysicalSize?.let { "${formatFloatKey(it.width)}x${formatFloatKey(it.height)}" } ?: "unknown"
+        val pixelArrayKey = pixelArraySize?.let { "${it.width}x${it.height}" } ?: "unknown"
+        val capabilitiesKey = capabilities
+            ?.sorted()
+            ?.joinToString("|")
+            ?: "none"
+        val supportedResolutionsKey = supportedResolutions.joinToString("|") { "${it.width}x${it.height}" }
+
+        return listOf(
+            lensFacing.toString(),
+            hasFlash.toString(),
+            focalLengthsKey,
+            physicalSizeKey,
+            pixelArrayKey,
+            capabilitiesKey,
+            supportedResolutionsKey
+        ).joinToString("#")
+    }
+
+    private fun buildImageAnalysisResolutionSelector(targetResolution: Size): androidx.camera.core.resolutionselector.ResolutionSelector {
+        return androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
+            .setResolutionFilter { supportedSizes, _ ->
+                val exactMatch = supportedSizes.filter { size ->
+                    size.width == targetResolution.width && size.height == targetResolution.height
+                }
+
+                if (exactMatch.isNotEmpty()) {
+                    exactMatch
+                } else {
+                    val targetPixels = targetResolution.width * targetResolution.height
+                    val targetAspectRatio = targetResolution.width.toFloat() / targetResolution.height.toFloat()
+
+                    val closest = supportedSizes.minByOrNull { size ->
+                        val pixels = size.width * size.height
+                        val aspectRatio = size.width.toFloat() / size.height.toFloat()
+                        val pixelDiff = kotlin.math.abs(pixels - targetPixels)
+                        val aspectDiff = kotlin.math.abs(aspectRatio - targetAspectRatio) * 1_000_000
+                        pixelDiff + aspectDiff.toInt()
+                    }
+
+                    closest?.let { listOf(it) } ?: supportedSizes
+                }
+            }
+            .build()
+    }
+
+    private fun initializeCameraProvider(onReady: (() -> Unit)? = null) {
+        cameraProvider?.let {
+            onReady?.let { callback ->
+                ContextCompat.getMainExecutor(this).execute { callback() }
+            }
+            return
+        }
+
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        cameraProviderFuture.addListener({
+            try {
+                cameraProvider = cameraProviderFuture.get()
+                Log.i(TAG, "Camera provider initialized successfully")
+                onReady?.let { callback ->
+                    ContextCompat.getMainExecutor(this).execute { callback() }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to get camera provider", e)
+                cameraProvider = null
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+    private fun maybeVerifySelectedCameraTorchCapability(reason: String) {
+        val selectedId = ensureSelectedCameraId() ?: return
+        val selectedGroup = getCameraGroupForRawId(selectedId) ?: return
+        val descriptor = cameraCharacteristicsCache[selectedId] ?: return
+
+        if (descriptor.lensFacing != CameraCharacteristics.LENS_FACING_BACK) {
+            updateTorchCapability(selectedGroup.groupKey, TorchCapabilityState.UNAVAILABLE, "front/external camera selected")
+            return
+        }
+
+        if (getTorchCapabilityState(selectedGroup.groupKey) != TorchCapabilityState.UNKNOWN) {
+            return
+        }
+
+        if (torchVerificationJob?.isActive == true) {
+            return
+        }
+
+        val boundCamera = camera ?: return
+        val boundId = boundCameraId ?: return
+        torchVerificationJob = serviceScope.launch {
+            when (verifyTorchCapabilityWhileActive(selectedGroup.groupKey, boundId, boundCamera, reason)) {
+                TorchVerificationResult.AVAILABLE -> {
+                    updateTorchCapability(
+                        selectedGroup.groupKey,
+                        TorchCapabilityState.AVAILABLE,
+                        "torch verification for cameraId=$boundId"
+                    )
+                }
+                TorchVerificationResult.UNAVAILABLE -> {
+                    updateTorchCapability(
+                        selectedGroup.groupKey,
+                        TorchCapabilityState.UNAVAILABLE,
+                        "torch verification for cameraId=$boundId"
+                    )
+                }
+                TorchVerificationResult.INCONCLUSIVE -> {
+                    Log.d(
+                        TAG,
+                        "Torch verification for group=${selectedGroup.groupKey} cameraId=$boundId was inconclusive; leaving capability UNKNOWN"
+                    )
+                }
+            }
+        }
+    }
+
+    private suspend fun verifyTorchCapabilityWhileActive(
+        groupKey: String,
+        cameraId: String,
+        boundCamera: androidx.camera.core.Camera,
+        reason: String
+    ): TorchVerificationResult {
+        return try {
+            Log.d(TAG, "Verifying torch support for group=$groupKey cameraId=$cameraId ($reason)")
+            withContext(Dispatchers.IO) {
+                boundCamera.cameraControl.enableTorch(true).get(TORCH_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                Thread.sleep(TORCH_PROBE_SETTLE_DELAY_MS)
+                boundCamera.cameraControl.enableTorch(false).get(TORCH_PROBE_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            }
+            Log.i(TAG, "Torch verified for group=$groupKey cameraId=$cameraId")
+            TorchVerificationResult.AVAILABLE
+        } catch (e: Exception) {
+            val rootCause = generateSequence<Throwable>(e) { it.cause }.last()
+            if (e is CancellationException || rootCause is CancellationException) {
+                Log.d(TAG, "Torch verification canceled for group=$groupKey cameraId=$cameraId", e)
+                return TorchVerificationResult.INCONCLUSIVE
+            }
+
+            if (rootCause is androidx.camera.core.CameraControl.OperationCanceledException) {
+                Log.d(TAG, "Torch verification interrupted because camera became inactive for group=$groupKey cameraId=$cameraId", e)
+                return TorchVerificationResult.INCONCLUSIVE
+            }
+
+            if (rootCause is IllegalStateException && rootCause.message?.contains("No flash unit", ignoreCase = true) == true) {
+                Log.w(TAG, "Torch verification reported no flash unit for group=$groupKey cameraId=$cameraId", e)
+                return TorchVerificationResult.UNAVAILABLE
+            }
+
+            Log.w(TAG, "Torch verification failed for group=$groupKey cameraId=$cameraId", e)
+            TorchVerificationResult.UNAVAILABLE
+        }
+    }
+
+    private fun updateTorchCapability(groupKey: String, capability: TorchCapabilityState, reason: String) {
+        val changed = synchronized(cameraCatalogLock) {
+            val current = torchCapabilityByGroupKey[groupKey]
+            if (current == capability) {
+                false
+            } else {
+                torchCapabilityByGroupKey[groupKey] = capability
+                true
+            }
+        }
+
+        if (!changed) {
+            return
+        }
+
+        val catalogChanged = publishCameraCatalogIfChanged(reason)
+        if (catalogChanged) {
+            saveSettings()
+        }
+
+        val selectedGroupKey = getCameraGroupForRawId(ensureSelectedCameraId())?.groupKey
+        if (selectedGroupKey == groupKey) {
+            when (capability) {
+                TorchCapabilityState.AVAILABLE -> {
+                    if (desiredTorchEnabled) {
+                        reconcileTorchState("torch capability available for selected camera")
+                    }
+                }
+                TorchCapabilityState.UNKNOWN -> Unit
+                TorchCapabilityState.UNAVAILABLE -> {
+                    if (desiredTorchEnabled) {
+                        desiredTorchEnabled = false
+                        saveSettings()
+                    }
+                    if (effectiveTorchEnabled) {
+                        reconcileTorchState("torch capability removed for selected camera")
+                    }
+                }
+            }
+        }
+
+        broadcastCameraState()
+        safeInvokeCameraStateCallback()
+    }
     
-    // Per-camera resolution memory: store resolution for each camera separately
-    private var backCameraResolution: Size? = null
-    private var frontCameraResolution: Size? = null
     // Flashlight control
     @Volatile private var camera: androidx.camera.core.Camera? = null
     private var cameraStateLiveData: androidx.lifecycle.LiveData<androidx.camera.core.CameraState>? = null
     private var cameraStateObserver: androidx.lifecycle.Observer<androidx.camera.core.CameraState>? = null
-    @Volatile private var isFlashlightOn: Boolean = false
-    @Volatile private var hasFlashUnit: Boolean = false
     @Volatile private var isTorchOperationInProgress: Boolean = false // Prevent concurrent torch operations
     // Camera binding state management
     @Volatile private var isBindingInProgress: Boolean = false
@@ -267,7 +861,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     @Volatile private var batteryMode: BatteryManagementMode = BatteryManagementMode.NORMAL
     @Volatile private var userOverrideBatteryLimit: Boolean = false // User can manually override critical mode if battery > 10%
     // State tracking for delta broadcasting (only send changed values via SSE)
-    private val lastBroadcastState = mutableMapOf<String, Any>()
+    private val lastBroadcastState = mutableMapOf<String, Any?>()
     private val broadcastLock = Any() // Lock for broadcast state synchronization
     private lateinit var lifecycleRegistry: LifecycleRegistry
     // LIFECYCLE MANAGEMENT: Use lifecycleScope for lifecycle-aware coroutines
@@ -341,13 +935,12 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     // Device identification
     @Volatile private var deviceName: String = "" // User-defined device name (default: IP_CAM_{deviceModel})
     
-    // Callbacks for MainActivity to receive updates
-    // LIFECYCLE SAFETY: These callbacks are cleared when MainActivity is destroyed (in MainActivity.onDestroy)
-    // and guarded by lifecycle checks before invocation to prevent crashes from dead contexts.
-    // Each callback invocation checks: 1) callback is not null, 2) runs on main thread via runOnUiThread wrapper
-    @Volatile private var onCameraStateChangedCallback: ((CameraSelector) -> Unit)? = null
+    // Callbacks for the currently active MainActivity instance.
+    // Only one visible activity should own these callbacks at a time, so writes are owner-scoped.
+    @Volatile private var onCameraStateChangedCallback: (() -> Unit)? = null
     @Volatile private var onFrameAvailableCallback: ((Bitmap) -> Unit)? = null
     @Volatile private var onConnectionsChangedCallback: (() -> Unit)? = null
+    @Volatile private var activityCallbackOwnerId: String? = null
     
     // Bitmap pool for memory-efficient bitmap reuse
     private val bitmapPool = BitmapPool(maxPoolSizeBytes = 64L * 1024 * 1024) // 64 MB pool
@@ -367,6 +960,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         h264Encoder?.stop()
         h264Encoder = null
         videoCaptureUseCase = null
+        if (hadRtspPipeline) {
+            rtspServer?.invalidateCodecConfig("RTSP pipeline cleared: $reason")
+        }
     }
 
     private fun hasBoundRtspPipeline(): Boolean {
@@ -444,7 +1040,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         MANUAL      // Manual activation via API (for testing/debugging)
     }
     
-    private val consumers = mutableSetOf<ConsumerType>()
+    private val consumers = mutableMapOf<ConsumerType, Int>()
     private val consumersLock = Any()
     
     companion object {
@@ -460,6 +1056,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
          private const val WATCHDOG_RETRY_DELAY_MS = 1_000L
          private const val WATCHDOG_MAX_RETRY_DELAY_MS = 30_000L
          private const val CAMERA_WATCHDOG_STARTUP_GRACE_MS = 3_000L
+         private const val CAMERA_PROBE_TIMEOUT_MS = 5_000L
+         private const val TORCH_PROBE_TIMEOUT_MS = 1_500L
+         private const val TORCH_PROBE_SETTLE_DELAY_MS = 150L
          // Camera rebinding debounce
          private const val CAMERA_REBIND_DEBOUNCE_MS = 500L // Minimum time between rebind requests
          // Intent extras
@@ -515,17 +1114,17 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         // This ensures the service only starts when permissions are available
         // If you see this service running, permissions were validated before start
         
-        // Load saved settings
-        loadSettings()
-        
         // Initialize camera characteristics cache early to avoid repeated IPC calls
         // This queries hardware capabilities once and caches them for the service lifetime
         initializeCameraCharacteristicsCache()
-        
-        // Check flash availability early so torch button is available on first page load
-        // This uses the cached characteristics to determine if current camera has flash
-        checkFlashAvailability()
-        Log.d(TAG, "Flash availability checked: hasFlashUnit=$hasFlashUnit for camera=${if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"}")
+
+        // Load saved settings before the camera provider comes up. Raw camera IDs are normalized
+        // to the current grouped catalog once bindable cameras become available.
+        loadSettings()
+
+        initializeCameraProvider {
+            rebuildCameraCatalog("service create")
+        }
         
         performanceMetrics = PerformanceMetrics(this)
         runtimeTelemetrySampler = RuntimeTelemetrySampler()
@@ -858,19 +1457,21 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             Log.w(TAG, "startCamera() called but Camera permission not granted - waiting for permission")
             return
         }
-        
-        Log.d(TAG, "startCamera() - initializing camera provider...")
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            try {
-                cameraProvider = cameraProviderFuture.get()
-                Log.i(TAG, "Camera provider initialized successfully")
-                bindCamera()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to get camera provider", e)
-                cameraProvider = null
+
+        Log.d(TAG, "startCamera() - ensuring camera provider is ready...")
+        initializeCameraProvider {
+            rebuildCameraCatalog("startCamera")
+            if (getVisibleCameraGroups().isEmpty()) {
+                Log.e(TAG, "startCamera() aborted - no usable camera groups available")
+                synchronized(cameraStateLock) {
+                    cameraState = CameraState.ERROR
+                }
+                broadcastCameraState()
+                safeInvokeCameraStateCallback()
+                return@initializeCameraProvider
             }
-        }, ContextCompat.getMainExecutor(this))
+            bindCamera()
+        }
     }
     
     private fun bindCamera() {
@@ -879,14 +1480,35 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             Log.w(TAG, "Cannot bind camera - lifecycle not in STARTED state: ${lifecycleRegistry.currentState}")
             lifecycleRegistry.currentState = Lifecycle.State.STARTED
         }
-        
+
         try {
             detachCameraStateObserver()
+            clearBoundCameraStartupTimeout()
             Log.d(TAG, "Unbinding all use cases before rebinding...")
             cameraProvider?.unbindAll()
+            camera = null
+            boundCameraGroupKey = null
+            boundCameraId = null
+            awaitingFirstFrameForBoundCamera = false
+
+            val cameraId = ensureSelectedCameraId()
+            if (cameraId == null) {
+                Log.e(TAG, "Cannot bind camera - no selectable camera is available")
+                rebuildCameraCatalog("bindCamera without selected camera")
+                return
+            }
+            val selectedCamera = cameraCharacteristicsCache[cameraId]
+            if (selectedCamera == null) {
+                Log.e(TAG, "Cannot bind camera - cached characteristics missing for cameraId=$cameraId")
+                return
+            }
             
             val resolution = selectedResolution ?: Size(1920, 1080)
-            Log.d(TAG, "Binding camera with resolution: ${resolution.width}x${resolution.height}")
+            Log.d(
+                TAG,
+                "Binding cameraId=$cameraId (${lensFacingToLabel(selectedCamera.lensFacing)}) " +
+                    "with resolution: ${resolution.width}x${resolution.height}"
+            )
             
             // === Use Case 1: Preview for H.264 Encoding (Hardware MediaCodec) ===
             // Only create when an RTSP client currently holds a camera lease.
@@ -963,40 +1585,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             }
             
             // === Use Case 2: ImageAnalysis for MJPEG (CPU, throttled to targetMjpegFps) ===
-            val resolutionSelector = androidx.camera.core.resolutionselector.ResolutionSelector.Builder()
-                .setResolutionFilter { supportedSizes, _ ->
-                    // Try to find exact match first
-                    val exactMatch = supportedSizes.filter { size ->
-                        size.width == resolution.width && size.height == resolution.height
-                    }
-                    
-                    if (exactMatch.isNotEmpty()) {
-                        Log.d(TAG, "Found exact resolution match: ${resolution.width}x${resolution.height}")
-                        exactMatch
-                    } else {
-                        // No exact match - find closest by total pixels
-                        val targetPixels = resolution.width * resolution.height
-                        val targetAspectRatio = resolution.width.toFloat() / resolution.height.toFloat()
-                        
-                        val closest = supportedSizes.minByOrNull { size ->
-                            val pixels = size.width * size.height
-                            val aspectRatio = size.width.toFloat() / size.height.toFloat()
-                            val pixelDiff = Math.abs(pixels - targetPixels)
-                            val aspectDiff = Math.abs(aspectRatio - targetAspectRatio) * 1000000 // Weight aspect ratio heavily
-                            pixelDiff + aspectDiff.toInt()
-                        }
-                        
-                        if (closest != null) {
-                            Log.w(TAG, "Exact resolution ${resolution.width}x${resolution.height} not available. Using closest: ${closest.width}x${closest.height}")
-                        } else {
-                            Log.e(TAG, "Could not find any suitable resolution. Using default.")
-                        }
-                        
-                        // Return closest match or all supported if none found
-                        closest?.let { listOf(it) } ?: supportedSizes
-                    }
-                }
-                .build()
+            val resolutionSelector = buildImageAnalysisResolutionSelector(resolution)
             
             val mjpegAnalysis = ImageAnalysis.Builder()
                 .setResolutionSelector(resolutionSelector)
@@ -1008,7 +1597,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 // This eliminates inefficient YUV→NV21→JPEG→Bitmap conversion
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
-                
+
             mjpegAnalysis.setAnalyzer(cameraExecutor) { image ->
                 processMjpegFrame(image)
             }
@@ -1026,7 +1615,8 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             videoCaptureUseCase?.let { useCases.add(it) }
             
             Log.d(TAG, "Binding ${useCases.size} use cases to lifecycle (ImageAnalysis${if (videoCaptureUseCase != null) " + H264 Preview" else ""})")
-            camera = cameraProvider?.bindToLifecycle(this, currentCamera, *useCases.toTypedArray())
+            val selector = buildCameraSelector(cameraId)
+            camera = cameraProvider?.bindToLifecycle(this, selector, *useCases.toTypedArray())
             
             if (camera == null) {
                 Log.e(TAG, "Camera binding returned null!")
@@ -1039,22 +1629,21 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 Log.i(TAG, "  2. Preview → H.264 Encoder (RTSP): $targetRtspFps fps target")
             }
             
-            // Check if flash is available for current camera
-            checkFlashAvailability()
-            
-            // Note: Torch restoration happens automatically via camera state observer
-            // When camera state changes to OPEN, torch is restored if isFlashlightOn=true
-            // See attachCameraStateObserver() for the observer lifecycle
-            
-            Log.d(TAG, "Camera bound successfully to ${if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"} camera. Frame processing should resume.")
+            Log.d(TAG, "Camera bound successfully to cameraId=$cameraId. Frame processing should resume.")
             
             camera?.let { attachCameraStateObserver(it) }
+            boundCameraGroupKey = getCameraGroupForRawId(cameraId)?.groupKey
+            boundCameraId = cameraId
+            awaitingFirstFrameForBoundCamera = true
+            startBoundCameraStartupTimeout(
+                expectedCameraId = cameraId,
+                expectedGroupKey = boundCameraGroupKey ?: ""
+            )
             
-            // Camera binding successful - update state
             noteCameraStartup("camera bound")
             synchronized(cameraStateLock) {
-                cameraState = CameraState.ACTIVE
-                Log.d(TAG, "Camera binding successful → ACTIVE state")
+                cameraState = CameraState.INITIALIZING
+                Log.d(TAG, "Camera binding successful → waiting for first frame")
             }
 
             if (pendingRtspPipelineRefresh) {
@@ -1063,10 +1652,16 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             
             // Notify observers that camera state has changed (binding completed)
             // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-            safeInvokeCameraStateCallback(currentCamera)
+            safeInvokeCameraStateCallback()
         } catch (e: Exception) {
             Log.e(TAG, "Camera binding failed with exception: ${e.message}", e)
             e.printStackTrace()
+            val failedCameraId = boundCameraId ?: selectedCameraId
+            if (failedCameraId != null) {
+                markCameraCandidateState(failedCameraId, CameraCandidateState.BROKEN, "bind exception")
+                selectedCameraId = ensureSelectedCameraId()
+            }
+            clearBoundCameraStartupTimeout()
             
             // Set error state
             synchronized(cameraStateLock) {
@@ -1076,6 +1671,8 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             
             // Clear camera reference on failure to allow watchdog to retry
             camera = null
+            boundCameraGroupKey = null
+            boundCameraId = null
             
             // Show error notification to user
             showUserNotification(
@@ -1096,11 +1693,8 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         try {
             Log.d(TAG, "Stopping camera...")
             
-            // TORCH INDEPENDENCE: Keep torch on after camera unbinds
-            // When camera unbinds via CameraControl, torch turns off automatically
-            // We need to re-enable it via CameraManager to maintain independence
-            // Only maintain torch if it was on and device has flash capability
-            val shouldMaintainTorch = isFlashlightOn && hasFlashUnit
+            val shouldMaintainTorch = desiredTorchEnabled &&
+                isTorchAvailableForGroup(getCameraGroupForRawId(boundCameraId ?: selectedCameraId)?.groupKey)
             
             // Stop RTSP pipeline first so MediaCodec and Preview surface are released before unbind.
             clearRtspPipeline("camera stop")
@@ -1108,6 +1702,12 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             // Clear old analyzer to stop frame processing
             imageAnalysis?.clearAnalyzer()
             detachCameraStateObserver()
+            torchVerificationJob?.cancel()
+            torchVerificationJob = null
+            clearBoundCameraStartupTimeout()
+            boundCameraGroupKey = null
+            boundCameraId = null
+            awaitingFirstFrameForBoundCamera = false
             
             // Unbind all use cases from lifecycle - MUST be on main thread
             android.os.Handler(android.os.Looper.getMainLooper()).post {
@@ -1117,20 +1717,13 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 } catch (e: Exception) {
                     Log.e(TAG, "Error unbinding camera", e)
                 } finally {
-                    // Clear camera reference after unbind completes (or fails)
-                    // This ensures enableTorch() will use CameraManager path
                     camera = null
                     Log.d(TAG, "Camera reference cleared, shouldMaintainTorch=$shouldMaintainTorch")
                     
-                    // Re-enable torch via CameraManager after camera unbinds (if it was on)
-                    // CameraControl.enableTorch() is no longer available after unbind
-                    // Use CameraManager.setTorchMode() to maintain torch independence
                     if (shouldMaintainTorch) {
-                        // Use longer delay to ensure camera is fully released
                         android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
-                            Log.d(TAG, "Re-enabling torch after camera unbind to maintain independence (camera=$camera)")
-                            enableTorch(true)
-                        }, 500) // Increased delay to ensure unbind is complete and camera fully released
+                            reconcileTorchState("camera unbound while torch requested")
+                        }, 500)
                     }
                 }
             }
@@ -1195,7 +1788,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     override fun fullCameraReset(): Boolean {
         Log.w(TAG, "fullCameraReset() - Performing DEEP camera service reset...")
         Log.i(TAG, "Pre-reset state: camera=$camera, provider=$cameraProvider, imageAnalysis=$imageAnalysis, state=$cameraState")
-        
+
         return try {
             // Cancel any pending bind operations
             pendingBindJob?.cancel()
@@ -1297,7 +1890,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             false
         }
     }
-    
+
     /**
      * Stop camera, apply settings, and restart camera.
      * This ensures settings are properly applied without conflicts.
@@ -1317,7 +1910,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      * - hasPendingRebind flag queues requests received during binding
      * 
      * PRIVATE: Only CameraService methods should trigger rebinding.
-     * External callers should use methods like switchCamera() or setResolutionAndRebind()
+     * External callers should use methods like selectCamera() or setResolutionAndRebind()
      * that encapsulate both the setting change and rebinding.
      */
     private fun requestBindCamera() {
@@ -1333,7 +1926,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             )
             return
         }
-        
+
         // Time-based debouncing: Check if enough time has passed since last request
         synchronized(bindingLock) {
             val timeSinceLastRequest = now - lastBindRequestTime
@@ -1441,7 +2034,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             }
         }
     }
-    
+
     /**
      * Process MJPEG frames (CPU-based, throttled to targetMjpegFps)
      * This is called by ImageAnalysis use case, separate from H.264 encoding
@@ -1461,6 +2054,26 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         val processingStart = System.currentTimeMillis()
         
         try {
+            if (awaitingFirstFrameForBoundCamera) {
+                awaitingFirstFrameForBoundCamera = false
+                clearBoundCameraStartupTimeout()
+                val activeCameraId = boundCameraId ?: ensureSelectedCameraId()
+                if (activeCameraId != null) {
+                    lastKnownGoodCameraId = activeCameraId
+                    markCameraCandidateState(activeCameraId, CameraCandidateState.WORKING, "first frame")
+                }
+                synchronized(cameraStateLock) {
+                    cameraState = CameraState.ACTIVE
+                }
+                Log.i(TAG, "First frame received from cameraId=${activeCameraId ?: "unknown"} → ACTIVE state")
+                broadcastCameraState()
+                safeInvokeCameraStateCallback()
+                maybeVerifySelectedCameraTorchCapability("first frame")
+                if (desiredTorchEnabled) {
+                    reconcileTorchState("first frame received")
+                }
+            }
+
             // === LIGHTWEIGHT OPERATIONS ON ANALYZER THREAD ===
             // These operations are fast and don't block the frame pipeline
             
@@ -1785,69 +2398,205 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                     val a = buffer.get().toInt() and 0xFF
                     pixels[col] = (a shl 24) or (r shl 16) or (g shl 8) or b
                 }
-                
+
                 // Set this row in the bitmap
                 bitmap.setPixels(pixels, 0, image.width, 0, row, image.width, 1)
             }
         }
-        
+
         return bitmap
     }
-    
-    /**
-     * Switch between front and back cameras.
-     * Preserves per-camera resolution settings and automatically rebinds the camera.
-     * 
-     * SAFETY: Uses requestBindCamera() which has built-in debouncing protection.
-     * Multiple rapid camera switches are safely queued and executed sequentially.
-     * 
-     * LIFECYCLE SAFETY: Uses safe callback invocation to notify MainActivity.
-     */
-    override fun switchCamera(cameraSelector: CameraSelector) {
-        // Save current camera's resolution before switching
-        if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) {
-            backCameraResolution = selectedResolution
-        } else {
-            frontCameraResolution = selectedResolution
-        }
-        
-        // Switch to new camera
-        currentCamera = cameraSelector
-        
-        // Restore new camera's resolution from memory
-        selectedResolution = if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) {
-            backCameraResolution
-        } else {
-            frontCameraResolution
-        }
-        
-        saveSettings()
-        
-        // TORCH INDEPENDENCE: Only disable torch if new camera doesn't have flash
-        // Check flash availability for new camera first
-        val oldHasFlash = hasFlashUnit
-        checkFlashAvailability() // Updates hasFlashUnit for new camera
-        
-        if (isFlashlightOn) {
-            if (!hasFlashUnit) {
-                // New camera doesn't have flash - disable torch
-                Log.d(TAG, "Switching to camera without flash - disabling torch")
-                isFlashlightOn = false
-                enableTorch(false)
-                saveSettings()
+
+    private fun markCameraCandidateState(cameraId: String, state: CameraCandidateState, reason: String) {
+        val group = getCameraGroupForRawId(cameraId)
+        val changed = synchronized(cameraCatalogLock) {
+            val previous = cameraCandidateStateById[cameraId]
+            if (previous == state) {
+                false
             } else {
-                // New camera also has flash - torch will be restored via camera state observer
-                Log.d(TAG, "Switching to camera with flash - torch will be restored after camera opens")
+                cameraCandidateStateById[cameraId] = state
+                if (group != null) {
+                    representativeCameraIdByGroupKey[group.groupKey] = chooseRepresentativeCameraIdLocked(
+                        group,
+                        preferredCameraId = representativeCameraIdByGroupKey[group.groupKey]
+                    )
+                }
+                true
             }
         }
-        
-        // Broadcast state change to web clients
+        if (!changed) {
+            return
+        }
+
+        group?.let { normalizeResolutionMappingsForCameraGroups(listOf(it)) }
+        ensureSelectedCameraId()
+        val catalogChanged = publishCameraCatalogIfChanged(reason)
+        if (catalogChanged) {
+            saveSettings()
+        }
+    }
+
+    private fun startBoundCameraStartupTimeout(expectedCameraId: String, expectedGroupKey: String) {
+        boundCameraStartupTimeoutJob?.cancel()
+        boundCameraStartupTimeoutJob = serviceScope.launch {
+            delay(CAMERA_PROBE_TIMEOUT_MS)
+            val stillAwaiting = awaitingFirstFrameForBoundCamera &&
+                boundCameraId == expectedCameraId &&
+                boundCameraGroupKey == expectedGroupKey
+            if (!stillAwaiting) {
+                return@launch
+            }
+
+            Log.w(
+                TAG,
+                "No first frame received from cameraId=$expectedCameraId within ${CAMERA_PROBE_TIMEOUT_MS}ms; " +
+                    "marking candidate as broken and retrying group=$expectedGroupKey"
+            )
+            awaitingFirstFrameForBoundCamera = false
+            markCameraCandidateState(expectedCameraId, CameraCandidateState.BROKEN, "first-frame timeout")
+
+            val fallbackId = ensureSelectedCameraId()
+            if (fallbackId == null) {
+                synchronized(cameraStateLock) {
+                    cameraState = CameraState.ERROR
+                }
+                broadcastCameraState()
+                safeInvokeCameraStateCallback()
+                return@launch
+            }
+
+            if (hasConsumers()) {
+                requestBindCamera()
+            }
+        }
+    }
+
+    private fun clearBoundCameraStartupTimeout() {
+        boundCameraStartupTimeoutJob?.cancel()
+        boundCameraStartupTimeoutJob = null
+    }
+
+    private suspend fun applyTorchState(
+        ownerCameraId: String,
+        shouldEnable: Boolean,
+        useCameraControl: Boolean,
+        boundCamera: androidx.camera.core.Camera?,
+        reason: String
+    ): Boolean {
+        return try {
+            if (useCameraControl && boundCamera != null) {
+                withContext(Dispatchers.IO) {
+                    boundCamera.cameraControl.enableTorch(shouldEnable).get(
+                        TORCH_PROBE_TIMEOUT_MS,
+                        TimeUnit.MILLISECONDS
+                    )
+                }
+            } else {
+                val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                cameraManager.setTorchMode(ownerCameraId, shouldEnable)
+            }
+            true
+        } catch (e: Exception) {
+            Log.w(
+                TAG,
+                "Failed to ${if (shouldEnable) "enable" else "disable"} torch for cameraId=$ownerCameraId ($reason)",
+                e
+            )
+            false
+        }
+    }
+
+    private fun reconcileTorchState(reason: String) {
+        if (isTorchOperationInProgress) {
+            Log.d(TAG, "Torch operation already in progress, skipping reconcile ($reason)")
+            return
+        }
+
+        val selectedId = ensureSelectedCameraId()
+        val selectedGroupKey = getCameraGroupForRawId(selectedId)?.groupKey
+        val shouldEnable = desiredTorchEnabled && isTorchAvailableForGroup(selectedGroupKey)
+        val ownerCameraId = if (shouldEnable) {
+            selectedId
+        } else {
+            effectiveTorchOwnerCameraId
+        }
+
+        if (ownerCameraId == null) {
+            val changed = effectiveTorchEnabled || effectiveTorchOwnerCameraId != null
+            effectiveTorchEnabled = false
+            effectiveTorchOwnerCameraId = null
+            if (changed) {
+                broadcastCameraState()
+                safeInvokeCameraStateCallback()
+            }
+            return
+        }
+
+        isTorchOperationInProgress = true
+        val boundCamera = camera
+        val useCameraControl = boundCamera != null && boundCameraId == ownerCameraId
+
+        serviceScope.launch {
+            val previousEffective = effectiveTorchEnabled
+            val previousOwner = effectiveTorchOwnerCameraId
+            val success = applyTorchState(
+                ownerCameraId = ownerCameraId,
+                shouldEnable = shouldEnable,
+                useCameraControl = useCameraControl,
+                boundCamera = boundCamera,
+                reason = reason
+            )
+
+            if (success) {
+                effectiveTorchEnabled = shouldEnable
+                effectiveTorchOwnerCameraId = if (shouldEnable) ownerCameraId else null
+            }
+
+            isTorchOperationInProgress = false
+
+            if (previousEffective != effectiveTorchEnabled || previousOwner != effectiveTorchOwnerCameraId) {
+                broadcastCameraState()
+                safeInvokeCameraStateCallback()
+            }
+        }
+    }
+
+    override fun selectCamera(cameraId: String): Boolean {
+        val targetGroup = getVisibleCameraGroups()
+            .firstOrNull { group -> group.candidates.any { it.cameraId == cameraId } }
+        if (targetGroup == null) {
+            Log.w(TAG, "Ignoring camera selection for unknown or unavailable cameraId=$cameraId")
+            return false
+        }
+
+        val targetRepresentativeId = getRepresentativeCameraDescriptor(targetGroup)?.cameraId ?: return false
+        val currentGroupKey = getCameraGroupForRawId(ensureSelectedCameraId())?.groupKey
+        if (currentGroupKey == targetGroup.groupKey) {
+            if (selectedCameraId != targetRepresentativeId) {
+                selectedCameraId = targetRepresentativeId
+                selectedResolution = resolutionByCameraId[targetRepresentativeId]
+                saveSettings()
+                broadcastCameraState()
+                safeInvokeCameraStateCallback()
+            }
+            return true
+        }
+
+        val targetTorchCapability = getTorchCapabilityState(targetGroup.groupKey)
+        if (targetTorchCapability == TorchCapabilityState.UNAVAILABLE && desiredTorchEnabled) {
+            desiredTorchEnabled = false
+            reconcileTorchState("selected camera changed to one without torch capability")
+        }
+
+        selectedCameraId = targetRepresentativeId
+        selectedResolution = resolutionByCameraId[targetRepresentativeId]
+        reconcileTorchState("selected camera changed")
+        saveSettings()
+
         broadcastCameraState()
-        
-        // Request bind but DON'T invoke callback here
-        // The callback will be invoked naturally when bindCamera() completes
-        // requestBindCamera() has debouncing protection to handle rapid calls safely
+        safeInvokeCameraStateCallback()
         requestBindCamera()
+        return true
     }
     
     /**
@@ -1873,7 +2622,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             
             try {
                 val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-                cameraManager.cameraIdList.forEach { id ->
+                cameraManager.cameraIdList.forEachIndexed { index, id ->
                     try {
                         val characteristics = cameraManager.getCameraCharacteristics(id)
                         val facing = characteristics.get(CameraCharacteristics.LENS_FACING) 
@@ -1883,138 +2632,54 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                         
                         // Get supported resolutions for this camera
                         val config = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                        val resolutions = config?.getOutputSizes(ImageFormat.YUV_420_888)?.toList() 
+                        val yuvResolutions = config?.getOutputSizes(ImageFormat.YUV_420_888)?.toList()
                             ?: emptyList()
+                        val previewResolutions = config?.getOutputSizes(SurfaceTexture::class.java)?.toList()
+                            ?: emptyList()
+                        val previewSet = previewResolutions.map { it.width to it.height }.toSet()
+                        val pipelineResolutions = yuvResolutions
+                            .filter { (it.width to it.height) in previewSet }
+                            .distinctBy { it.width to it.height }
+                            .sortedByDescending { it.width * it.height }
+                        val hardwareFingerprint = buildCameraFingerprint(
+                            lensFacing = facing,
+                            hasFlash = hasFlash,
+                            focalLengths = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS),
+                            sensorPhysicalSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE),
+                            pixelArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE),
+                            capabilities = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES),
+                            supportedResolutions = pipelineResolutions
+                        )
                         
                         val cached = CachedCameraCharacteristics(
                             cameraId = id,
+                            ordinal = index,
                             lensFacing = facing,
                             hasFlash = hasFlash,
-                            supportedResolutions = resolutions
+                            yuvOutputResolutions = yuvResolutions,
+                            previewOutputResolutions = previewResolutions,
+                            supportedResolutions = pipelineResolutions,
+                            hardwareFingerprint = hardwareFingerprint
                         )
                         cameraCharacteristicsCache[id] = cached
                         
-                        Log.d(TAG, "Cached characteristics for camera $id: facing=$facing, hasFlash=$hasFlash, resolutions=${resolutions.size}")
+                        Log.d(
+                            TAG,
+                            "Cached characteristics for camera $id: facing=$facing, hasFlash=$hasFlash, " +
+                                "yuvResolutions=${yuvResolutions.size}, previewResolutions=${previewResolutions.size}, " +
+                                "pipelineResolutions=${pipelineResolutions.size}"
+                        )
                     } catch (e: Exception) {
                         Log.w(TAG, "Failed to cache characteristics for camera $id", e)
                     }
                 }
                 Log.d(TAG, "Camera characteristics cache initialized with ${cameraCharacteristicsCache.size} cameras")
                 cameraCharacteristicsCacheInitialized = true
+                ensureSelectedCameraId()
             } catch (e: Exception) {
                 Log.e(TAG, "Error initializing camera characteristics cache", e)
                 // Don't set initialized flag on failure, allowing retry
             }
-        }
-    }
-    
-    /**
-     * Check if the current camera has a flash unit using Camera2 API
-     * Uses cached characteristics to avoid expensive IPC calls.
-     * Assumes cache is already initialized in onCreate().
-     */
-    private fun checkFlashAvailability() {
-        hasFlashUnit = false
-        
-        // If cache not initialized (e.g., initialization failed), log warning and return
-        if (!cameraCharacteristicsCacheInitialized) {
-            Log.w(TAG, "Camera characteristics cache not initialized, cannot check flash availability")
-            return
-        }
-        
-        try {
-            val targetFacing = if (currentCamera == CameraSelector.DEFAULT_FRONT_CAMERA) {
-                CameraCharacteristics.LENS_FACING_FRONT
-            } else {
-                CameraCharacteristics.LENS_FACING_BACK
-            }
-            
-            // Use cached characteristics instead of querying CameraManager
-            // Returns the first camera matching the target facing direction
-            // (maintains original behavior - most devices have only one camera per facing)
-            for ((id, cached) in cameraCharacteristicsCache) {
-                if (cached.lensFacing == targetFacing) {
-                    hasFlashUnit = cached.hasFlash
-                    Log.d(TAG, "Flash available for camera $id (facing=$targetFacing): $hasFlashUnit (from cache)")
-                    return
-                }
-            }
-            
-            Log.d(TAG, "No camera found with facing=$targetFacing in cache")
-        } catch (e: Exception) {
-            Log.e(TAG, "Error checking flash availability", e)
-        }
-    }
-    
-    /**
-     * Enable or disable the camera torch
-     * Automatically uses the correct method based on camera binding state:
-     * - When camera is bound: Uses CameraControl.enableTorch() (required by Android)
-     * - When camera is NOT bound: Uses CameraManager.setTorchMode() (independent control)
-     * 
-     * This ensures torch works in both states and survives camera unbind/rebind cycles.
-     */
-    private fun enableTorch(enable: Boolean) {
-        try {
-            Log.d(TAG, "enableTorch($enable) called, hasFlashUnit=$hasFlashUnit, camera=${camera != null}")
-            
-            if (!hasFlashUnit) {
-                Log.w(TAG, "Cannot enable torch: no flash unit available")
-                return
-            }
-            
-            // Prevent concurrent torch operations to avoid OperationCanceledException
-            if (isTorchOperationInProgress) {
-                Log.d(TAG, "Torch operation already in progress, skipping redundant call to enableTorch($enable)")
-                return
-            }
-            
-            // Check if camera is currently bound
-            val currentCamera = camera
-            if (currentCamera != null) {
-                // Camera is bound - MUST use CameraControl.enableTorch()
-                // Android doesn't allow CameraManager.setTorchMode() on an in-use camera
-                Log.d(TAG, "Using CameraControl.enableTorch($enable) - camera is bound")
-                isTorchOperationInProgress = true
-                val cameraControl = currentCamera.cameraControl
-                val future = cameraControl.enableTorch(enable)
-                future.addListener({
-                    try {
-                        future.get() // Will throw if operation failed
-                        Log.d(TAG, "Torch ${if (enable) "enabled" else "disabled"} via CameraControl (camera bound)")
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to ${if (enable) "enable" else "disable"} torch via CameraControl", e)
-                    } finally {
-                        isTorchOperationInProgress = false
-                    }
-                }, ContextCompat.getMainExecutor(this))
-            } else {
-                // Camera is NOT bound - use CameraManager for independent control
-                Log.d(TAG, "Using CameraManager.setTorchMode($enable) - camera not bound")
-                val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-                
-                // Find the camera ID for the current camera (back or front)
-                val targetFacing = if (this.currentCamera == CameraSelector.DEFAULT_FRONT_CAMERA) {
-                    CameraCharacteristics.LENS_FACING_FRONT
-                } else {
-                    CameraCharacteristics.LENS_FACING_BACK
-                }
-                
-                // Get camera ID from cache
-                val cameraId = cameraCharacteristicsCache.values
-                    .firstOrNull { it.lensFacing == targetFacing }
-                    ?.cameraId
-                
-                if (cameraId != null) {
-                    // Use CameraManager.setTorchMode() - only works when camera is NOT in use
-                    cameraManager.setTorchMode(cameraId, enable)
-                    Log.d(TAG, "Torch ${if (enable) "enabled" else "disabled"} for camera $cameraId via CameraManager (camera not bound)")
-                } else {
-                    Log.w(TAG, "Could not find camera ID for torch control")
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error controlling torch", e)
         }
     }
     
@@ -2024,74 +2689,73 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      * Does NOT require camera to be active - uses CameraManager directly when unbound
      */
     override fun toggleFlashlight(): Boolean {
-        if (!hasFlashUnit) {
+        if (!isFlashlightAvailable()) {
             Log.w(TAG, "No flash unit available for current camera")
             return false
         }
-        
-        isFlashlightOn = !isFlashlightOn
-        enableTorch(isFlashlightOn)
+
+        desiredTorchEnabled = !desiredTorchEnabled
+        reconcileTorchState("flashlight toggled")
         saveSettings()
-        
-        // Broadcast state change to web clients
+
         broadcastCameraState()
-        
-        // Notify MainActivity of flashlight state change
-        // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-        safeInvokeCameraStateCallback(currentCamera)
-        return isFlashlightOn
+        safeInvokeCameraStateCallback()
+        return desiredTorchEnabled
     }
     
     /**
      * Set flashlight to specific state (on or off)
-     * Only works for back camera with flash unit
      * Returns true if state was set successfully, false otherwise
      * Does NOT require camera to be active - uses CameraManager directly
      */
     fun setFlashlight(enabled: Boolean): Boolean {
-        if (currentCamera != CameraSelector.DEFAULT_BACK_CAMERA) {
-            Log.w(TAG, "Flashlight only available for back camera")
-            return false
-        }
-        
-        if (!hasFlashUnit) {
+        if (!isFlashlightAvailable()) {
             Log.w(TAG, "No flash unit available")
             return false
         }
-        
-        // Only update if state is different
-        if (isFlashlightOn != enabled) {
-            isFlashlightOn = enabled
-            enableTorch(isFlashlightOn)
+
+        if (desiredTorchEnabled != enabled) {
+            desiredTorchEnabled = enabled
+            reconcileTorchState("flashlight state updated")
             saveSettings()
-            
-            // Broadcast state change to web clients
             broadcastCameraState()
-            
-            // Notify MainActivity of flashlight state change
-            // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-            safeInvokeCameraStateCallback(currentCamera)
+            safeInvokeCameraStateCallback()
         }
-        
+
         return true
     }
     
     /**
      * Get current flashlight state
      */
-    override fun isFlashlightEnabled(): Boolean = isFlashlightOn
+    override fun isFlashlightEnabled(): Boolean = effectiveTorchEnabled
     
     /**
      * Check if flashlight is available (current camera has flash unit)
      */
     override fun isFlashlightAvailable(): Boolean {
-        return hasFlashUnit
+        return isTorchAvailableForGroup(getCameraGroupForRawId(ensureSelectedCameraId())?.groupKey)
     }
     
-    override fun getCurrentCamera(): CameraSelector = currentCamera
+    override fun getAvailableCameras(): List<CameraOption> = buildCameraOptions()
+
+    override fun getSelectedCameraId(): String? = ensureSelectedCameraId()
+
+    override fun getSelectedCameraLabel(): String {
+        val selectedId = ensureSelectedCameraId()
+        return buildCameraOptions().firstOrNull { it.cameraId == selectedId }?.displayName ?: "Not available"
+    }
+
+    override fun getSelectedCameraFacing(): String {
+        val selectedId = ensureSelectedCameraId()
+        return buildCameraOptions().firstOrNull { it.cameraId == selectedId }?.facing ?: "unknown"
+    }
+
+    override fun getCameraCatalogVersion(): Int = cameraCatalogVersion
     
     override fun getSupportedResolutions(): List<Size> {
-        return getSupportedResolutions(currentCamera)
+        val cameraId = ensureSelectedCameraId() ?: return emptyList()
+        return getSupportedResolutions(cameraId)
     }
     
     override fun getSelectedResolution(): Size? = selectedResolution
@@ -2102,10 +2766,11 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      */
     private fun updateCurrentCameraResolution(resolution: Size?) {
         selectedResolution = resolution
-        if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) {
-            backCameraResolution = resolution
+        val cameraId = ensureSelectedCameraId() ?: return
+        if (resolution == null) {
+            resolutionByCameraId.remove(cameraId)
         } else {
-            frontCameraResolution = resolution
+            resolutionByCameraId[cameraId] = resolution
         }
     }
     
@@ -2148,8 +2813,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     
     override fun setCameraOrientation(orientation: String) {
         cameraOrientation = orientation
-        // Clear resolution cache when orientation changes to force refresh with new filter
-        resolutionCache.clear()
         saveSettings()
         
         // Broadcast state change to web clients
@@ -2157,7 +2820,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         
         // Notify MainActivity of orientation change so it can reload resolutions
         // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-        safeInvokeCameraStateCallback(currentCamera)
+        safeInvokeCameraStateCallback()
     }
     
     fun getCameraOrientation(): String = cameraOrientation
@@ -2171,7 +2834,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         
         // Notify MainActivity of rotation change
         // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-        safeInvokeCameraStateCallback(currentCamera)
+        safeInvokeCameraStateCallback()
     }
     
     fun getRotation(): Int = rotation
@@ -2185,7 +2848,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         
         // Notify MainActivity of overlay setting change
         // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-        safeInvokeCameraStateCallback(currentCamera)
+        safeInvokeCameraStateCallback()
     }
     
     fun getShowResolutionOverlay(): Boolean = showResolutionOverlay
@@ -2196,7 +2859,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         saveSettings()
         broadcastCameraState()
         // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-        safeInvokeCameraStateCallback(currentCamera)
+        safeInvokeCameraStateCallback()
     }
     
     override fun getShowDateTimeOverlay(): Boolean = showDateTimeOverlay
@@ -2206,7 +2869,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         saveSettings()
         broadcastCameraState()
         // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-        safeInvokeCameraStateCallback(currentCamera)
+        safeInvokeCameraStateCallback()
     }
     
     override fun getShowBatteryOverlay(): Boolean = showBatteryOverlay
@@ -2216,7 +2879,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         saveSettings()
         broadcastCameraState()
         // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-        safeInvokeCameraStateCallback(currentCamera)
+        safeInvokeCameraStateCallback()
     }
     
     override fun getShowFpsOverlay(): Boolean = showFpsOverlay
@@ -2233,7 +2896,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             saveSettings()
             broadcastCameraState()
             // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-            safeInvokeCameraStateCallback(currentCamera)
+            safeInvokeCameraStateCallback()
             Log.d(TAG, "Target MJPEG FPS set to $targetMjpegFps (throttling applied in frame processing)")
         }
     }
@@ -2256,13 +2919,13 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 Log.d(TAG, "RTSP FPS changed from $oldFps to $targetRtspFps, rebinding active RTSP pipeline")
                 broadcastCameraState()
                 // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-                safeInvokeCameraStateCallback(currentCamera)
+                safeInvokeCameraStateCallback()
                 requestBindCamera()
             } else {
                 // No active RTSP pipeline, just broadcast the setting change
                 broadcastCameraState()
                 // LIFECYCLE SAFETY: Use safe callback to prevent crashes if MainActivity destroyed
-                safeInvokeCameraStateCallback(currentCamera)
+                safeInvokeCameraStateCallback()
             }
         }
     }
@@ -2500,7 +3163,13 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             ConnectionLimits.fromLegacyMaxConnections(legacyMaxConnections)
         }
 
-        isFlashlightOn = prefs.getBoolean("flashlightOn", false)
+        desiredTorchEnabled = when {
+            prefs.contains("desiredTorchEnabled") -> prefs.getBoolean("desiredTorchEnabled", false)
+            prefs.contains("flashlightOn") -> prefs.getBoolean("flashlightOn", false)
+            else -> false
+        }
+        effectiveTorchEnabled = false
+        effectiveTorchOwnerCameraId = null
         
         // NOTE: RTSP is now on-demand only, no persistence of enabled state
         // Only persist RTSP configuration (bitrate, mode) for when it's activated
@@ -2511,55 +3180,63 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         val defaultDeviceName = "IP_CAM_${Build.MODEL.replace(" ", "_")}"
         deviceName = prefs.getString("deviceName", defaultDeviceName) ?: defaultDeviceName
         
-        // Migration: Check for old single resolution format and migrate to per-camera format
+        resolutionByCameraId.clear()
+        cameraCharacteristicsCache.keys.forEach { cameraId ->
+            val width = prefs.getInt("cameraResolution.$cameraId.width", -1)
+            val height = prefs.getInt("cameraResolution.$cameraId.height", -1)
+            if (width > 0 && height > 0) {
+                resolutionByCameraId[cameraId] = Size(width, height)
+            }
+        }
+
+        // Legacy migration from front/back settings to cameraId-based storage.
         val oldResWidth = prefs.getInt("resolutionWidth", -1)
         val oldResHeight = prefs.getInt("resolutionHeight", -1)
-        val hasOldFormat = oldResWidth > 0 && oldResHeight > 0
-        
-        // Load per-camera resolutions
-        val backResWidth = prefs.getInt("backCameraResolutionWidth", -1)
-        val backResHeight = prefs.getInt("backCameraResolutionHeight", -1)
-        if (backResWidth > 0 && backResHeight > 0) {
-            backCameraResolution = Size(backResWidth, backResHeight)
-        } else if (hasOldFormat) {
-            // Migration: Apply old resolution to back camera (most common default)
-            backCameraResolution = Size(oldResWidth, oldResHeight)
-            Log.d(TAG, "Migrated old resolution ${oldResWidth}x${oldResHeight} to back camera")
-        }
-        
-        val frontResWidth = prefs.getInt("frontCameraResolutionWidth", -1)
-        val frontResHeight = prefs.getInt("frontCameraResolutionHeight", -1)
-        if (frontResWidth > 0 && frontResHeight > 0) {
-            frontCameraResolution = Size(frontResWidth, frontResHeight)
-        }
-        
-        val cameraType = prefs.getString("cameraType", "back")
-        currentCamera = if (cameraType == "front") {
-            CameraSelector.DEFAULT_FRONT_CAMERA
-        } else {
-            CameraSelector.DEFAULT_BACK_CAMERA
-        }
-        
-        // Set selectedResolution based on current camera
-        selectedResolution = if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) {
-            backCameraResolution
-        } else {
-            frontCameraResolution
-        }
-        
-        // Migration: Clean up old format keys after successful migration
-        if (hasOldFormat && (backCameraResolution != null || frontCameraResolution != null)) {
-            prefs.edit().apply {
-                remove("resolutionWidth")
-                remove("resolutionHeight")
-                apply()
+        if (oldResWidth > 0 && oldResHeight > 0) {
+            getDefaultCameraIdForFacing(CameraCharacteristics.LENS_FACING_BACK)?.let { backCameraId ->
+                resolutionByCameraId.putIfAbsent(backCameraId, Size(oldResWidth, oldResHeight))
+                Log.d(TAG, "Migrated legacy resolution ${oldResWidth}x${oldResHeight} to cameraId=$backCameraId")
             }
-            Log.d(TAG, "Cleaned up old resolution format keys")
         }
-        
+
+        val legacyBackResWidth = prefs.getInt("backCameraResolutionWidth", -1)
+        val legacyBackResHeight = prefs.getInt("backCameraResolutionHeight", -1)
+        if (legacyBackResWidth > 0 && legacyBackResHeight > 0) {
+            getDefaultCameraIdForFacing(CameraCharacteristics.LENS_FACING_BACK)?.let { backCameraId ->
+                resolutionByCameraId.putIfAbsent(backCameraId, Size(legacyBackResWidth, legacyBackResHeight))
+            }
+        }
+
+        val legacyFrontResWidth = prefs.getInt("frontCameraResolutionWidth", -1)
+        val legacyFrontResHeight = prefs.getInt("frontCameraResolutionHeight", -1)
+        if (legacyFrontResWidth > 0 && legacyFrontResHeight > 0) {
+            getDefaultCameraIdForFacing(CameraCharacteristics.LENS_FACING_FRONT)?.let { frontCameraId ->
+                resolutionByCameraId.putIfAbsent(frontCameraId, Size(legacyFrontResWidth, legacyFrontResHeight))
+            }
+        }
+
+        val persistedSelectedCameraId = prefs.getString("selectedCameraId", null)
+        val legacyCameraType = prefs.getString("cameraType", null)
+        val migratedSelectedCameraId = when (legacyCameraType) {
+            "front" -> getDefaultCameraIdForFacing(CameraCharacteristics.LENS_FACING_FRONT)
+            "back" -> getDefaultCameraIdForFacing(CameraCharacteristics.LENS_FACING_BACK)
+            else -> null
+        }
+        selectedCameraId = when {
+            persistedSelectedCameraId != null && cameraCharacteristicsCache.containsKey(persistedSelectedCameraId) -> persistedSelectedCameraId
+            migratedSelectedCameraId != null -> migratedSelectedCameraId
+            else -> getDefaultCameraId()
+        }
+
+        selectedResolution = selectedCameraId?.let { resolutionByCameraId[it] }
+
         Log.d(
             TAG,
-            "Loaded settings: camera=$cameraType, orientation=$cameraOrientation, rotation=$rotation, resolution=${selectedResolution?.let { "${it.width}x${it.height}" } ?: "auto"}, connectionLimits=$connectionLimits, flashlight=$isFlashlightOn, mjpegFps=$targetMjpegFps, rtspFps=$targetRtspFps, rtspBitrate=$rtspBitrate, rtspBitrateMode=$rtspBitrateMode, adaptiveQuality=$adaptiveQualityEnabled, deviceName=$deviceName"
+                "Loaded settings: cameraId=${selectedCameraId ?: "none"}, orientation=$cameraOrientation, rotation=$rotation, " +
+                "resolution=${selectedResolution?.let { "${it.width}x${it.height}" } ?: "auto"}, " +
+                "connectionLimits=$connectionLimits, desiredTorch=$desiredTorchEnabled, mjpegFps=$targetMjpegFps, " +
+                "rtspFps=$targetRtspFps, rtspBitrate=$rtspBitrate, rtspBitrateMode=$rtspBitrateMode, " +
+                "adaptiveQuality=$adaptiveQualityEnabled, deviceName=$deviceName"
         )
     }
     
@@ -2587,7 +3264,8 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             putInt(PREF_MAX_RTSP_SESSIONS, connectionLimits.maxRtspSessions)
             remove(PREF_LEGACY_MAX_CONNECTIONS)
             remove("maxMjpegStreamsPerIp")
-            putBoolean("flashlightOn", isFlashlightOn)
+            putBoolean("desiredTorchEnabled", desiredTorchEnabled)
+            remove("flashlightOn")
             
             // NOTE: RTSP enabled state is NOT persisted (on-demand only)
             putInt("rtspBitrate", rtspBitrate)
@@ -2595,26 +3273,27 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             
             // Save device name
             putString("deviceName", deviceName)
-            
-            // Save per-camera resolutions
-            backCameraResolution?.let {
-                putInt("backCameraResolutionWidth", it.width)
-                putInt("backCameraResolutionHeight", it.height)
-            } ?: run {
-                remove("backCameraResolutionWidth")
-                remove("backCameraResolutionHeight")
+
+            putString("selectedCameraId", selectedCameraId)
+            cameraCharacteristicsCache.keys.forEach { cameraId ->
+                val resolution = resolutionByCameraId[cameraId]
+                if (resolution != null) {
+                    putInt("cameraResolution.$cameraId.width", resolution.width)
+                    putInt("cameraResolution.$cameraId.height", resolution.height)
+                } else {
+                    remove("cameraResolution.$cameraId.width")
+                    remove("cameraResolution.$cameraId.height")
+                }
             }
-            
-            frontCameraResolution?.let {
-                putInt("frontCameraResolutionWidth", it.width)
-                putInt("frontCameraResolutionHeight", it.height)
-            } ?: run {
-                remove("frontCameraResolutionWidth")
-                remove("frontCameraResolutionHeight")
-            }
-            
-            val cameraType = if (currentCamera == CameraSelector.DEFAULT_FRONT_CAMERA) "front" else "back"
-            putString("cameraType", cameraType)
+
+            // Remove legacy camera selection and resolution keys after migration to cameraId-based storage.
+            remove("cameraType")
+            remove("resolutionWidth")
+            remove("resolutionHeight")
+            remove("backCameraResolutionWidth")
+            remove("backCameraResolutionHeight")
+            remove("frontCameraResolutionWidth")
+            remove("frontCameraResolutionHeight")
             
             apply()
         }
@@ -2631,11 +3310,21 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         orientationEventListener = null
     }
     
-    fun setOnCameraStateChangedCallback(callback: (CameraSelector) -> Unit) {
-        onCameraStateChangedCallback = callback
+    fun registerActivityCallbacks(
+        ownerId: String,
+        onCameraStateChanged: () -> Unit,
+        onConnectionsChanged: () -> Unit
+    ) {
+        activityCallbackOwnerId = ownerId
+        onCameraStateChangedCallback = onCameraStateChanged
+        onConnectionsChangedCallback = onConnectionsChanged
     }
-    
-    fun setOnFrameAvailableCallback(callback: ((Bitmap) -> Unit)?) {
+
+    fun setPreviewFrameCallback(ownerId: String, callback: ((Bitmap) -> Unit)?) {
+        if (activityCallbackOwnerId != ownerId) {
+            Log.d(TAG, "Ignoring preview frame callback from stale owner=$ownerId")
+            return
+        }
         onFrameAvailableCallback = callback
     }
 
@@ -2643,22 +3332,23 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         bitmapPool.recycleBitmap(bitmap)
     }
     
-    fun setOnConnectionsChangedCallback(callback: () -> Unit) {
-        onConnectionsChangedCallback = callback
-    }
-    
-    /**
-     * Clear all callbacks to prevent memory leaks and crashes.
-     * MUST be called in MainActivity.onDestroy() to break the reference cycle.
-     * 
-     * LIFECYCLE SAFETY: This method ensures callbacks are cleared when MainActivity is destroyed,
-     * preventing CameraService from holding stale references to destroyed Activity contexts.
-     */
-    fun clearCallbacks() {
-        Log.d(TAG, "Clearing all MainActivity callbacks")
+    fun clearActivityCallbacks(ownerId: String) {
+        if (activityCallbackOwnerId != ownerId) {
+            Log.d(TAG, "Ignoring callback clear from stale owner=$ownerId")
+            return
+        }
+        Log.d(TAG, "Clearing MainActivity callbacks for owner=$ownerId")
         onCameraStateChangedCallback = null
         onFrameAvailableCallback = null
         onConnectionsChangedCallback = null
+        activityCallbackOwnerId = null
+    }
+
+    private fun clearAllActivityCallbacks() {
+        onCameraStateChangedCallback = null
+        onFrameAvailableCallback = null
+        onConnectionsChangedCallback = null
+        activityCallbackOwnerId = null
     }
     
     /**
@@ -2668,7 +3358,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      * LIFECYCLE SAFETY: Checks that callback exists and service is in a valid lifecycle state
      * before invoking to prevent crashes from callbacks to destroyed contexts.
      */
-    private fun safeInvokeCameraStateCallback(selector: CameraSelector) {
+    private fun safeInvokeCameraStateCallback() {
         // Check if service is in valid lifecycle state (not DESTROYED)
         if (lifecycleRegistry.currentState == Lifecycle.State.DESTROYED) {
             Log.w(TAG, "Skipping camera state callback - service lifecycle is DESTROYED")
@@ -2676,7 +3366,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         }
         
         // Invoke callback if set
-        onCameraStateChangedCallback?.invoke(selector)
+        onCameraStateChangedCallback?.invoke()
     }
     
     /**
@@ -2753,9 +3443,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 }
                 androidx.camera.core.CameraState.Type.OPEN -> {
                     Log.i(TAG, "Camera is open and ready")
-                    if (isFlashlightOn && hasFlashUnit) {
-                        Log.d(TAG, "Camera opened - restoring torch state")
-                        enableTorch(true)
+                    if (desiredTorchEnabled && isTorchAvailableForGroup(boundCameraGroupKey)) {
+                        Log.d(TAG, "Camera opened - reconciling requested torch state")
+                        reconcileTorchState("camera opened")
                     }
                 }
             }
@@ -2768,6 +3458,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                      error.code == androidx.camera.core.CameraState.ERROR_CAMERA_FATAL_ERROR ||
                      error.code == androidx.camera.core.CameraState.ERROR_CAMERA_IN_USE)) {
                     Log.e(TAG, "Critical camera error detected, clearing camera reference for recovery")
+                    boundCameraId?.let { failedCameraId ->
+                        markCameraCandidateState(failedCameraId, CameraCandidateState.BROKEN, "critical camera error")
+                    }
                     camera = null
                 }
             }
@@ -2836,7 +3529,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         connectionLimits = normalizedLimits
         saveSettings()
         broadcastCameraState()
-        safeInvokeCameraStateCallback(currentCamera)
+        safeInvokeCameraStateCallback()
         safeInvokeConnectionsCallback()
         broadcastImmediateTelemetrySnapshot()
         return true
@@ -2949,13 +3642,28 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         
         // Clear all MainActivity callbacks immediately to prevent memory leaks
         // This breaks the reference cycle between Service and Activity
-        clearCallbacks()
-        
-        // Disable torch if it's on before destroying service to release the resource
-        if (isFlashlightOn) {
+        clearAllActivityCallbacks()
+
+        torchVerificationJob?.cancel()
+        torchVerificationJob = null
+        clearBoundCameraStartupTimeout()
+        val torchOwnerToDisable = effectiveTorchOwnerCameraId ?: boundCameraId ?: selectedCameraId
+        desiredTorchEnabled = false
+        if (effectiveTorchEnabled && torchOwnerToDisable != null) {
             Log.d(TAG, "Disabling torch before destroying service")
-            enableTorch(false)
+            runBlocking {
+                applyTorchState(
+                    ownerCameraId = torchOwnerToDisable,
+                    shouldEnable = false,
+                    useCameraControl = camera != null && boundCameraId == torchOwnerToDisable,
+                    boundCamera = camera,
+                    reason = "service destroy"
+                )
+            }
         }
+        effectiveTorchEnabled = false
+        effectiveTorchOwnerCameraId = null
+        isTorchOperationInProgress = false
         
         unregisterNetworkReceiver()
         unregisterBatteryReceiver()
@@ -3713,51 +4421,19 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     
     override fun sizeLabel(size: Size): String = "${size.width}$RESOLUTION_DELIMITER${size.height}"
     
-    private fun getSupportedResolutions(cameraSelector: CameraSelector): List<Size> {
-        val targetFacing = if (cameraSelector == CameraSelector.DEFAULT_FRONT_CAMERA) {
-            CameraCharacteristics.LENS_FACING_FRONT
-        } else {
-            CameraCharacteristics.LENS_FACING_BACK
-        }
-        
-        // Check if resolution cache already has filtered/processed resolutions for this facing
-        resolutionCache[targetFacing]?.let { return it }
-        
-        // Use cached camera characteristics instead of making IPC calls
-        val sizes = if (cameraCharacteristicsCacheInitialized) {
-            // Get resolutions from cache
-            cameraCharacteristicsCache.values
-                .filter { it.lensFacing == targetFacing }
-                .flatMap { it.supportedResolutions }
-        } else {
-            // Fallback: if cache not initialized, query directly (shouldn't happen in normal flow)
-            Log.w(TAG, "Camera characteristics cache not initialized, falling back to direct query")
-            val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            cameraManager.cameraIdList.mapNotNull { id ->
-                val characteristics = cameraManager.getCameraCharacteristics(id)
-                val facing = characteristics.get(CameraCharacteristics.LENS_FACING)
-                if (facing != targetFacing) return@mapNotNull null
-                val config = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                config?.getOutputSizes(ImageFormat.YUV_420_888)?.toList()
-            }.flatten()
-        }
-        
-        // Filter resolutions based on camera orientation
-        val filtered = sizes.filter { size ->
+    private fun getSupportedResolutions(cameraId: String): List<Size> {
+        val descriptor = cameraCharacteristicsCache[cameraId] ?: return emptyList()
+
+        return descriptor.supportedResolutions.filter { size ->
             val isLandscape = size.width > size.height
             val isPortrait = size.height > size.width
-            
+
             when (cameraOrientation) {
                 "landscape" -> isLandscape || size.width == size.height
                 "portrait" -> isPortrait || size.width == size.height
-                else -> true // If orientation not set, allow all
+                else -> true
             }
-        }
-        
-        val distinct = filtered.distinctBy { Pair(it.width, it.height) }
-            .sortedByDescending { it.width * it.height }
-        resolutionCache[targetFacing] = distinct
-        return distinct
+        }.sortedByDescending { it.width * it.height }
     }
     
     // ==================== CameraServiceInterface Implementation ====================
@@ -3772,28 +4448,20 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         return selectedResolution?.let { sizeLabel(it) } ?: "auto"
     }
     
-    override fun getCameraStateJson(): String {
-        val cameraName = if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"
+    private fun buildCameraStateMap(): Map<String, Any?> {
+        val cameraId = ensureSelectedCameraId()
+        val selectedCamera = cameraId?.let { cameraCharacteristicsCache[it] }
+        val cameraLabel = buildCameraOptions().firstOrNull { it.cameraId == cameraId }?.displayName ?: "Not available"
+        val cameraFacing = selectedCamera?.let { lensFacingToLabel(it.lensFacing) } ?: "unknown"
         val resolutionLabel = selectedResolution?.let { sizeLabel(it) } ?: "auto"
         val rtspEnabled = isRTSPEnabled()
         val limits = connectionLimits
 
-        return """{"camera":"$cameraName","resolution":"$resolutionLabel","cameraOrientation":"$cameraOrientation","rotation":$rotation,"showDateTimeOverlay":$showDateTimeOverlay,"showBatteryOverlay":$showBatteryOverlay,"showResolutionOverlay":$showResolutionOverlay,"showFpsOverlay":$showFpsOverlay,"targetMjpegFps":$targetMjpegFps,"targetRtspFps":$targetRtspFps,"maxMjpegStreams":${limits.maxMjpegStreams},"maxSseClients":${limits.maxSseClients},"maxRtspSessions":${limits.maxRtspSessions},"adaptiveQualityEnabled":false,"flashlightAvailable":${isFlashlightAvailable()},"flashlightOn":${isFlashlightEnabled()},"batteryMode":"${batteryMode.name}","streamingAllowed":${isStreamingAllowed()},"rtspEnabled":$rtspEnabled}"""
-    }
-    
-    /**
-     * Get camera state JSON with only changed values (delta broadcasting)
-     * This reduces bandwidth and prevents unnecessary UI updates for unchanged values
-     * Returns null if nothing has changed since last broadcast
-     */
-    override fun getCameraStateDeltaJson(): String? {
-        val cameraName = if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"
-        val resolutionLabel = selectedResolution?.let { sizeLabel(it) } ?: "auto"
-        val rtspEnabled = isRTSPEnabled()
-        val limits = connectionLimits
-
-        val currentState = mapOf<String, Any>(
-            "camera" to cameraName,
+        return mapOf(
+            "cameraId" to cameraId,
+            "cameraLabel" to cameraLabel,
+            "cameraFacing" to cameraFacing,
+            "cameraCatalogVersion" to cameraCatalogVersion,
             "resolution" to resolutionLabel,
             "cameraOrientation" to cameraOrientation,
             "rotation" to rotation,
@@ -3813,6 +4481,31 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             "streamingAllowed" to isStreamingAllowed(),
             "rtspEnabled" to rtspEnabled
         )
+    }
+
+    private fun toJsonValue(value: Any?): String {
+        return when (value) {
+            null -> "null"
+            is String -> "\"$value\""
+            is Boolean, is Int, is Float -> value.toString()
+            else -> "\"$value\""
+        }
+    }
+
+    override fun getCameraStateJson(): String {
+        val json = buildCameraStateMap().entries.joinToString(",") { (key, value) ->
+            "\"$key\":${toJsonValue(value)}"
+        }
+        return "{$json}"
+    }
+
+    /**
+     * Get camera state JSON with only changed values (delta broadcasting)
+     * This reduces bandwidth and prevents unnecessary UI updates for unchanged values
+     * Returns null if nothing has changed since last broadcast
+     */
+    override fun getCameraStateDeltaJson(): String? {
+        val currentState = buildCameraStateMap()
         
         // Find changed fields
         val changes = mutableListOf<String>()
@@ -3826,14 +4519,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 }
                 
                 if (hasChanged) {
-                    // Format value for JSON
-                    val jsonValue = when (value) {
-                        is String -> "\"$value\""
-                        is Boolean -> value.toString()
-                        is Int -> value.toString()
-                        is Float -> value.toString()
-                        else -> value.toString()
-                    }
+                    val jsonValue = toJsonValue(value)
                     changes.add("\"$key\":$jsonValue")
                     // Update last broadcast state
                     lastBroadcastState[key] = value
@@ -3855,31 +4541,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      * Called when a new SSE client connects to prevent sending full state again on next delta
      */
     override fun initializeLastBroadcastState() {
-        val cameraName = if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"
-        val resolutionLabel = selectedResolution?.let { sizeLabel(it) } ?: "auto"
-        val limits = connectionLimits
-        
         synchronized(broadcastLock) {
             lastBroadcastState.clear()
-            lastBroadcastState["camera"] = cameraName
-            lastBroadcastState["resolution"] = resolutionLabel
-            lastBroadcastState["cameraOrientation"] = cameraOrientation
-            lastBroadcastState["rotation"] = rotation
-            lastBroadcastState["showDateTimeOverlay"] = showDateTimeOverlay
-            lastBroadcastState["showBatteryOverlay"] = showBatteryOverlay
-            lastBroadcastState["showResolutionOverlay"] = showResolutionOverlay
-            lastBroadcastState["showFpsOverlay"] = showFpsOverlay
-            lastBroadcastState["targetMjpegFps"] = targetMjpegFps
-            lastBroadcastState["targetRtspFps"] = targetRtspFps
-            lastBroadcastState["maxMjpegStreams"] = limits.maxMjpegStreams
-            lastBroadcastState["maxSseClients"] = limits.maxSseClients
-            lastBroadcastState["maxRtspSessions"] = limits.maxRtspSessions
-            lastBroadcastState["adaptiveQualityEnabled"] = false
-            lastBroadcastState["flashlightAvailable"] = isFlashlightAvailable()
-            lastBroadcastState["flashlightOn"] = isFlashlightEnabled()
-            lastBroadcastState["batteryMode"] = batteryMode.name
-            lastBroadcastState["streamingAllowed"] = isStreamingAllowed()
-            lastBroadcastState["rtspEnabled"] = isRTSPEnabled()
+            lastBroadcastState.putAll(buildCameraStateMap())
         }
     }
     
@@ -4149,11 +4813,16 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      */
     private fun registerConsumer(type: ConsumerType) {
         synchronized(consumersLock) {
-            val wasEmpty = consumers.isEmpty()
-            consumers.add(type)
-            Log.d(TAG, "Registered consumer: $type, total consumers: ${consumers.size}")
+            val totalConsumersBefore = consumers.values.sum()
+            val nextCount = consumers.getOrDefault(type, 0) + 1
+            consumers[type] = nextCount
+            val totalConsumersAfter = totalConsumersBefore + 1
+            Log.d(
+                TAG,
+                "Registered consumer: $type, typeCount=$nextCount, total consumers: $totalConsumersAfter"
+            )
             
-            if (wasEmpty) {
+            if (totalConsumersBefore == 0) {
                 Log.d(TAG, "First consumer registered, activating camera...")
                 activateCameraForConsumers()
             }
@@ -4166,10 +4835,25 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      */
     private fun unregisterConsumer(type: ConsumerType) {
         synchronized(consumersLock) {
-            consumers.remove(type)
-            Log.d(TAG, "Unregistered consumer: $type, remaining consumers: ${consumers.size}")
+            val currentCount = consumers[type]
+            if (currentCount == null) {
+                Log.w(TAG, "Ignoring unregister for non-existent consumer: $type")
+                return
+            }
+
+            if (currentCount <= 1) {
+                consumers.remove(type)
+            } else {
+                consumers[type] = currentCount - 1
+            }
+
+            val remainingConsumers = consumers.values.sum()
+            Log.d(
+                TAG,
+                "Unregistered consumer: $type, typeCount=${consumers[type] ?: 0}, remaining consumers: $remainingConsumers"
+            )
             
-            if (consumers.isEmpty()) {
+            if (remainingConsumers == 0) {
                 Log.d(TAG, "Last consumer unregistered, deactivating camera...")
                 deactivateCameraForConsumers()
             }
@@ -4190,7 +4874,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      */
     fun getConsumerCount(): Int {
         synchronized(consumersLock) {
-            return consumers.size
+            return consumers.values.sum()
         }
     }
     

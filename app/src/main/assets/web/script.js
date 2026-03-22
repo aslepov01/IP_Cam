@@ -77,25 +77,82 @@
                     };
                     streamImg.onload = () => { lastFrame = Date.now(); };
 
-                    function switchCamera() {
-                        const wasStreamActive = streamActive;
-                        
-                        fetch('/switch')
+                    function syncCameraSelection(cameraId) {
+                        const select = document.getElementById('cameraSelect');
+                        if (!select || cameraId === undefined || cameraId === null) {
+                            return;
+                        }
+
+                        const options = select.options;
+                        for (let i = 0; i < options.length; i++) {
+                            if (options[i].value === cameraId) {
+                                if (select.selectedIndex !== i) {
+                                    select.selectedIndex = i;
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    function loadCameras() {
+                        return fetch('/cameras')
                             .then(response => response.json())
                             .then(data => {
-                                showAlert('Switched to ' + data.camera + ' camera', 'success');
-                                
-                                if (wasStreamActive) {
-                                    setTimeout(() => {
-                                        reloadStream();
-                                    }, STREAM_RELOAD_DELAY_MS);
+                                const select = document.getElementById('cameraSelect');
+                                select.innerHTML = '';
+
+                                data.cameras.forEach(camera => {
+                                    const option = document.createElement('option');
+                                    option.value = camera.id;
+                                    option.textContent = camera.label;
+                                    if (data.selectedCameraId === camera.id) {
+                                        option.selected = true;
+                                    }
+                                    select.appendChild(option);
+                                });
+
+                                lastReceivedState.cameraCatalogVersion = data.cameraCatalogVersion;
+                                if (data.selectedCameraId) {
+                                    lastReceivedState.cameraId = data.selectedCameraId;
+                                    lastReceivedState.cameraLabel = data.selectedCameraLabel;
+                                    lastReceivedState.cameraFacing = data.selectedCameraFacing;
+                                    syncCameraSelection(data.selectedCameraId);
                                 }
-                                
-                                loadFormats();
-                                updateFlashlightButton();
+                            });
+                    }
+
+                    function applyCameraSelection() {
+                        const select = document.getElementById('cameraSelect');
+                        const cameraId = select.value;
+                        if (!cameraId) {
+                            showAlert('No camera selected', 'warning');
+                            return;
+                        }
+
+                        const wasStreamActive = streamActive;
+
+                        fetch('/selectCamera?cameraId=' + encodeURIComponent(cameraId))
+                            .then(response => response.json())
+                            .then(data => {
+                                if (data.status !== 'ok') {
+                                    throw new Error(data.message || 'Failed to select camera');
+                                }
+
+                                lastReceivedState.cameraId = data.cameraId;
+                                lastReceivedState.cameraLabel = data.cameraLabel;
+                                lastReceivedState.cameraFacing = data.cameraFacing;
+                                showAlert('Selected ' + data.cameraLabel, 'success');
+
+                                if (wasStreamActive) {
+                                    setTimeout(reloadStream, STREAM_RELOAD_DELAY_MS);
+                                }
+
+                                return Promise.all([loadCameras(), loadFormats()]).then(() => {
+                                    updateFlashlightButton();
+                                });
                             })
                             .catch(error => {
-                                showAlert('Error switching camera: ' + error, 'danger');
+                                showAlert('Error selecting camera: ' + error, 'danger');
                             });
                     }
 
@@ -182,7 +239,7 @@
                     }
 
                     function loadFormats() {
-                        fetch('/formats')
+                        return fetch('/formats')
                             .then(response => response.json())
                             .then(data => {
                                 const select = document.getElementById('formatSelect');
@@ -200,6 +257,11 @@
                                     }
                                     select.appendChild(option);
                                 });
+                                if (data.selectedCameraId) {
+                                    lastReceivedState.cameraId = data.selectedCameraId;
+                                    lastReceivedState.cameraLabel = data.selectedCameraLabel;
+                                    syncCameraSelection(data.selectedCameraId);
+                                }
                                 showAlert(data.selected ? 'Selected: ' + data.selected : 'Selected: Auto', 'info');
                             });
                     }
@@ -633,7 +695,7 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                         }
                     }
 
-                    loadFormats();
+                    loadCameras().then(() => loadFormats());
                     refreshConnections();
                     updateFlashlightButton();
 
@@ -666,6 +728,13 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                                     lastReceivedMetrics.batteryLevel,
                                     lastReceivedMetrics.isCharging
                                 );
+                            }
+
+                            if (data.cameraId !== undefined) {
+                                lastReceivedState.cameraId = data.cameraId;
+                                lastReceivedState.cameraLabel = data.cameraLabel;
+                                lastReceivedState.cameraFacing = data.cameraFacing;
+                                syncCameraSelection(data.cameraId);
                             }
                         });
 
@@ -916,7 +985,7 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                             updateFlashlightButton();
                             
                             // Reload stream if it's active and settings changed (not just status)
-                            const settingsChanged = deltaState.camera || deltaState.resolution || deltaState.rotation;
+                            const settingsChanged = deltaState.cameraId !== undefined || deltaState.resolution !== undefined || deltaState.rotation !== undefined;
                             if (streamActive && settingsChanged) {
                                 console.log('Reloading stream to reflect state changes');
                                 setTimeout(reloadStream, STREAM_RELOAD_DELAY_MS);
@@ -928,9 +997,18 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                                 stopStream();
                             }
                             
-                            // If camera switched, reload formats
-                            if (deltaState.camera !== undefined) {
-                                console.log('Camera changed, reloading formats');
+                            const cameraSelectionChanged =
+                                deltaState.cameraId !== undefined ||
+                                deltaState.cameraLabel !== undefined ||
+                                deltaState.cameraFacing !== undefined ||
+                                deltaState.cameraCatalogVersion !== undefined;
+
+                            if (cameraSelectionChanged) {
+                                console.log('Camera selection changed, reloading camera metadata');
+                                loadCameras();
+                                loadFormats();
+                            } else if (deltaState.cameraOrientation !== undefined) {
+                                console.log('Camera orientation changed, reloading formats');
                                 loadFormats();
                             }
                             

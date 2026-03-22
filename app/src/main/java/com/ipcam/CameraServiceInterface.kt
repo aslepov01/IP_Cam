@@ -1,7 +1,6 @@
 package com.ipcam
 
 import android.util.Size
-import androidx.camera.core.CameraSelector
 import java.io.File
 
 /**
@@ -11,8 +10,12 @@ import java.io.File
  */
 interface CameraServiceInterface {
     // Camera operations
-    fun getCurrentCamera(): CameraSelector
-    fun switchCamera(cameraSelector: CameraSelector)
+    fun getAvailableCameras(): List<CameraOption>
+    fun getSelectedCameraId(): String?
+    fun getSelectedCameraLabel(): String
+    fun getSelectedCameraFacing(): String
+    fun getCameraCatalogVersion(): Int
+    fun selectCamera(cameraId: String): Boolean
     fun toggleFlashlight(): Boolean
     fun isFlashlightAvailable(): Boolean
     fun isFlashlightEnabled(): Boolean

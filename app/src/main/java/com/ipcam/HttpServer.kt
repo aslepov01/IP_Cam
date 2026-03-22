@@ -4,7 +4,6 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
 import android.util.Size
-import androidx.camera.core.CameraSelector
 import io.ktor.http.*
 import io.ktor.server.application.*
 import io.ktor.server.cio.*
@@ -136,7 +135,8 @@ class HttpServer(
                 get("/stream") { serveStream() }
                 
                 // Camera control
-                get("/switch") { serveSwitch() }
+                get("/cameras") { serveCameras() }
+                get("/selectCamera") { serveSelectCamera() }
                 get("/toggleFlashlight") { serveToggleFlashlight() }
                 get("/flashOn") { serveFlashlightOn() }
                 get("/flashOff") { serveFlashlightOff() }
@@ -740,24 +740,59 @@ class HttpServer(
         }
     }
     
-    private suspend fun PipelineContext<Unit, ApplicationCall>.serveSwitch() {
-        val newCamera = if (cameraService.getCurrentCamera() == CameraSelector.DEFAULT_BACK_CAMERA) {
-            CameraSelector.DEFAULT_FRONT_CAMERA
-        } else {
-            CameraSelector.DEFAULT_BACK_CAMERA
+    private suspend fun PipelineContext<Unit, ApplicationCall>.serveCameras() {
+        val cameras = cameraService.getAvailableCameras()
+        val selectedCameraId = cameraService.getSelectedCameraId()
+        val selectedCamera = cameras.firstOrNull { it.cameraId == selectedCameraId }
+        val camerasJson = cameras.joinToString(",") { camera ->
+            """{"id":"${escapeJson(camera.cameraId)}","label":"${escapeJson(camera.displayName)}","facing":"${escapeJson(camera.facing)}","hasFlash":${camera.hasFlash}}"""
         }
-        
-        cameraService.switchCamera(newCamera)
-        
-        val cameraName = if (cameraService.getCurrentCamera() == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"
+
         call.respondText(
-            """{"status": "ok", "camera": "$cameraName"}""",
+            """
+            {
+                "cameraCatalogVersion": ${cameraService.getCameraCatalogVersion()},
+                "selectedCameraId": ${selectedCameraId?.let { "\"${escapeJson(it)}\"" } ?: "null"},
+                "selectedCameraLabel": ${selectedCamera?.displayName?.let { "\"${escapeJson(it)}\"" } ?: "null"},
+                "selectedCameraFacing": ${selectedCamera?.facing?.let { "\"${escapeJson(it)}\"" } ?: "null"},
+                "cameras": [$camerasJson]
+            }
+            """.trimIndent(),
             ContentType.Application.Json
         )
     }
-    
+
+    private suspend fun PipelineContext<Unit, ApplicationCall>.serveSelectCamera() {
+        val cameraId = call.parameters["cameraId"]?.trim()
+        if (cameraId.isNullOrEmpty()) {
+            call.respondText(
+                """{"status":"error","message":"Missing cameraId parameter"}""",
+                ContentType.Application.Json,
+                HttpStatusCode.BadRequest
+            )
+            return
+        }
+
+        val selected = cameraService.selectCamera(cameraId)
+        if (!selected) {
+            call.respondText(
+                """{"status":"error","message":"Unknown or unavailable cameraId: ${escapeJson(cameraId)}"}""",
+                ContentType.Application.Json,
+                HttpStatusCode.BadRequest
+            )
+            return
+        }
+
+        call.respondText(
+            """{"status":"ok","cameraId":"${escapeJson(cameraId)}","cameraLabel":"${escapeJson(cameraService.getSelectedCameraLabel())}","cameraFacing":"${escapeJson(cameraService.getSelectedCameraFacing())}"}""",
+            ContentType.Application.Json
+        )
+    }
+
     private suspend fun PipelineContext<Unit, ApplicationCall>.serveStatus() {
-        val cameraName = if (cameraService.getCurrentCamera() == CameraSelector.DEFAULT_BACK_CAMERA) "back" else "front"
+        val selectedCameraId = cameraService.getSelectedCameraId()
+        val selectedCameraLabel = cameraService.getSelectedCameraLabel()
+        val selectedCameraFacing = cameraService.getSelectedCameraFacing()
         val limits = cameraService.getConnectionLimits()
         val activeStreamCount = activeStreams.get()
         val sseCount = synchronized(sseClientsLock) { sseClients.size }
@@ -775,14 +810,17 @@ class HttpServer(
         val deviceName = cameraService.getDeviceName()
         val cameraState = cameraService.getCameraStateString()
         
-        val endpoints = "[\"/\", \"/snapshot\", \"/stream\", \"/switch\", \"/status\", \"/metrics\", \"/events\", \"/toggleFlashlight\", \"/flashOn\", \"/flashOff\", \"/formats\", \"/connections\", \"/stats\", \"/overrideBatteryLimit\", \"/cameraState\", \"/activateCamera\", \"/deactivateCamera\", \"/checkUpdate\", \"/triggerUpdate\", \"/reboot\", \"/setConnectionLimits\"]"
+        val endpoints = "[\"/\", \"/snapshot\", \"/stream\", \"/cameras\", \"/selectCamera\", \"/status\", \"/metrics\", \"/events\", \"/toggleFlashlight\", \"/flashOn\", \"/flashOff\", \"/formats\", \"/connections\", \"/stats\", \"/overrideBatteryLimit\", \"/cameraState\", \"/activateCamera\", \"/deactivateCamera\", \"/checkUpdate\", \"/triggerUpdate\", \"/reboot\", \"/setConnectionLimits\"]"
         
         val json = """
             {
                 "status": "running",
                 "server": "Ktor",
                 "deviceName": "$deviceName",
-                "camera": "$cameraName",
+                "cameraId": ${selectedCameraId?.let { "\"${escapeJson(it)}\"" } ?: "null"},
+                "cameraLabel": "${escapeJson(selectedCameraLabel)}",
+                "cameraFacing": "${escapeJson(selectedCameraFacing)}",
+                "cameraCatalogVersion": ${cameraService.getCameraCatalogVersion()},
                 "cameraState": "$cameraState",
                 "url": "${cameraService.getServerUrl()}",
                 "resolution": "${cameraService.getSelectedResolutionLabel()}",
@@ -941,8 +979,11 @@ class HttpServer(
             """{"value":"$label","label":"$label"}"""
         }
         val selected = cameraService.getSelectedResolution()?.let { "\"${cameraService.sizeLabel(it)}\"" } ?: "null"
+        val selectedCameraId = cameraService.getSelectedCameraId()
         val json = """
             {
+                "selectedCameraId": ${selectedCameraId?.let { "\"${escapeJson(it)}\"" } ?: "null"},
+                "selectedCameraLabel": "${escapeJson(cameraService.getSelectedCameraLabel())}",
                 "formats": [$jsonFormats],
                 "selected": $selected
             }
@@ -1245,7 +1286,7 @@ class HttpServer(
     private suspend fun PipelineContext<Unit, ApplicationCall>.serveToggleFlashlight() {
         if (!cameraService.isFlashlightAvailable()) {
             call.respondText(
-                """{"status":"error","message":"Flashlight not available. Ensure back camera is selected and device has flash unit.","available":false}""",
+                """{"status":"error","message":"Flashlight not available for the selected camera.","available":false}""",
                 ContentType.Application.Json,
                 HttpStatusCode.BadRequest
             )
@@ -1262,7 +1303,7 @@ class HttpServer(
     private suspend fun PipelineContext<Unit, ApplicationCall>.serveFlashlightOn() {
         if (!cameraService.isFlashlightAvailable()) {
             call.respondText(
-                """{"status":"error","message":"Flashlight not available. Ensure back camera is selected and device has flash unit.","available":false}""",
+                """{"status":"error","message":"Flashlight not available for the selected camera.","available":false}""",
                 ContentType.Application.Json,
                 HttpStatusCode.BadRequest
             )
@@ -1287,7 +1328,7 @@ class HttpServer(
     private suspend fun PipelineContext<Unit, ApplicationCall>.serveFlashlightOff() {
         if (!cameraService.isFlashlightAvailable()) {
             call.respondText(
-                """{"status":"error","message":"Flashlight not available. Ensure back camera is selected and device has flash unit.","available":false}""",
+                """{"status":"error","message":"Flashlight not available for the selected camera.","available":false}""",
                 ContentType.Application.Json,
                 HttpStatusCode.BadRequest
             )

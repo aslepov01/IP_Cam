@@ -96,7 +96,9 @@
                         <div class="card">
                             <h3>Camera Selection</h3>
                             <div class="form-row">
-                                <button onclick="switchCamera()">Switch Camera</button>
+                                <label for="cameraSelect">Camera:</label>
+                                <select id="cameraSelect"></select>
+                                <button onclick="applyCameraSelection()">Apply Camera</button>
                             </div>
                         </div>
                         
@@ -198,7 +200,6 @@
                                 </select>
                                 <button onclick="applyRtspFps()">Apply FPS</button>
                             </div>
-                            <div class="alert info">RTSP FPS change requires RTSP server restart (disable/enable) to take effect.</div>
                         </div>
                     </div>
                     
@@ -373,20 +374,24 @@
                         <div class="card">
                             <h3>Camera Control</h3>
                             <div class="endpoint">
-                                <strong>Switch Camera:</strong> <a href="/switch" target="_blank"><code>GET /switch</code></a><br>
-                                Switches between front and back camera
+                                <strong>List Cameras:</strong> <a href="/cameras" target="_blank"><code>GET /cameras</code></a><br>
+                                Returns available camera IDs, labels, and capabilities
+                            </div>
+                            <div class="endpoint">
+                                <strong>Select Camera:</strong> <code>GET /selectCamera?cameraId=ID</code><br>
+                                Selects a specific camera by its camera ID
                             </div>
                             <div class="endpoint">
                                 <strong>Toggle Flashlight:</strong> <a href="/toggleFlashlight" target="_blank"><code>GET /toggleFlashlight</code></a><br>
-                                Toggle flashlight on/off for back camera
+                                Toggle flashlight on/off for the selected camera, if supported
                             </div>
                             <div class="endpoint">
                                 <strong>Turn Flashlight On:</strong> <a href="/flashOn" target="_blank"><code>GET /flashOn</code></a><br>
-                                Turn flashlight on for back camera (idempotent)
+                                Turn flashlight on for the selected camera (idempotent)
                             </div>
                             <div class="endpoint">
                                 <strong>Turn Flashlight Off:</strong> <a href="/flashOff" target="_blank"><code>GET /flashOff</code></a><br>
-                                Turn flashlight off for back camera (idempotent)
+                                Turn flashlight off for the selected camera (idempotent)
                             </div>
                             <div class="endpoint">
                                 <strong>Set Format:</strong> <code>GET /setFormat?value=WIDTHxHEIGHT</code><br>
@@ -414,7 +419,7 @@
                             </div>
                             <div class="endpoint">
                                 <strong>Formats:</strong> <a href="/formats" target="_blank"><code>GET /formats</code></a><br>
-                                Lists supported camera resolutions for the active lens
+                                Lists supported camera resolutions for the selected camera
                             </div>
                             <div class="endpoint">
                                 <strong>Connections:</strong> <a href="/connections" target="_blank"><code>GET /connections</code></a><br>

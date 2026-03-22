@@ -1,5 +1,6 @@
 package com.ipcam
 
+import android.annotation.SuppressLint
 import android.app.KeyguardManager
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
@@ -163,6 +164,7 @@ object RebootHelper {
     /**
      * Try rebooting via PowerManager (may work with Device Owner privileges)
      */
+    @SuppressLint("MissingPermission")
     private fun tryPowerManagerReboot(context: Context): RebootResult {
         return try {
             val pm = context.getSystemService(Context.POWER_SERVICE) as? PowerManager

@@ -29,9 +29,9 @@ import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.CameraSelector
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import java.util.UUID
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -42,11 +42,11 @@ class MainActivity : AppCompatActivity() {
     private lateinit var serverStatusText: TextView
     private lateinit var serverUrlText: TextView
     private lateinit var cameraSelectionText: TextView
+    private lateinit var cameraSpinner: Spinner
     private lateinit var endpointsText: TextView
     private lateinit var resolutionSpinner: Spinner
     private lateinit var cameraOrientationSpinner: Spinner
     private lateinit var rotationSpinner: Spinner
-    private lateinit var switchCameraButton: Button
     private lateinit var flashlightButton: Button
     private lateinit var startStopButton: Button
     private lateinit var autoStartCheckBox: android.widget.CheckBox
@@ -125,7 +125,9 @@ class MainActivity : AppCompatActivity() {
     private var currentPreviewBitmap: android.graphics.Bitmap? = null
     
     private var cameraService: CameraService? = null
-    private var isServiceBound = false
+    private var serviceConnection: ServiceConnection? = null
+    private var hasActiveServiceBinding = false
+    private var serviceBindingState = ServiceBindingState.UNBOUND
     private var hasCameraPermission = false
     private var hasNotificationPermission = false
     private var allPermissionsGranted = false
@@ -135,6 +137,8 @@ class MainActivity : AppCompatActivity() {
     
     // Track last applied resolution to prevent infinite loop when setSelection triggers onItemSelected
     private var lastAppliedResolution: String? = null
+    private var cameraOptions: List<CameraOption> = emptyList()
+    private var serviceCallbackToken: String? = null
     
     // Handler and Runnable for periodic metrics updates
     private val metricsUpdateHandler = Handler(Looper.getMainLooper())
@@ -164,6 +168,12 @@ class MainActivity : AppCompatActivity() {
         private const val PREF_DEVICE_OWNER_EXPANDED = "deviceOwnerExpanded"
         private const val PREF_SOFTWARE_UPDATE_EXPANDED = "softwareUpdateExpanded"
         private const val TAG = "MainActivity"
+    }
+
+    private enum class ServiceBindingState {
+        UNBOUND,
+        BINDING,
+        BOUND
     }
     
     // Request multiple permissions at once
@@ -251,80 +261,135 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
-    private val serviceConnection = object : ServiceConnection {
-        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
-            val binder = service as CameraService.LocalBinder
-            cameraService = binder.getService()
-            isServiceBound = true
-            
-            // Set up callbacks to receive updates from the service
-            cameraService?.setOnCameraStateChangedCallback { _ ->
-                runOnUiThread {
-                    // Set flag to prevent spinner listeners from triggering during programmatic updates
-                    isUpdatingSpinners = true
-                    try {
-                        updateUI()
-                        // Don't call loadResolutions() here - it causes constant spinner refreshing
-                        // Resolution spinner only needs updating when:
-                        // 1. Camera switches (different supported resolutions) - handled in switchCamera()
-                        // 2. User explicitly changes resolution - handled in applyResolution()
-                        loadConnectionLimitOptions()
-                        loadCameraOrientationOptions()
-                        loadRotationOptions()
-                    } finally {
-                        // Use post() to defer resetting the flag until AFTER all pending UI events are processed
-                        // This ensures setSelection() completes before flag is cleared, preventing infinite rebind loop
-                        // setSelection() posts to UI thread, so we must also post the flag reset
-                        resolutionSpinner.post {
-                            isUpdatingSpinners = false
+    private fun createServiceConnection(): ServiceConnection {
+        return object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+                if (serviceConnection !== this) {
+                    Log.d(TAG, "Ignoring stale onServiceConnected callback")
+                    return
+                }
+
+                val binder = service as CameraService.LocalBinder
+                cameraService = binder.getService()
+                hasActiveServiceBinding = true
+                serviceBindingState = ServiceBindingState.BOUND
+                val callbackToken = UUID.randomUUID().toString()
+                serviceCallbackToken = callbackToken
+
+                // Set up callbacks to receive updates from the service
+                cameraService?.registerActivityCallbacks(
+                    ownerId = callbackToken,
+                    onCameraStateChanged = {
+                        runOnUiThread {
+                            // Set flag to prevent spinner listeners from triggering during programmatic updates
+                            isUpdatingSpinners = true
+                            try {
+                                updateUI()
+                                loadCameraOptions()
+                                loadResolutions()
+                                loadConnectionLimitOptions()
+                                loadCameraOrientationOptions()
+                                loadRotationOptions()
+                            } finally {
+                                // Use post() to defer resetting the flag until AFTER all pending UI events are processed
+                                // This ensures setSelection() completes before flag is cleared, preventing infinite rebind loop
+                                // setSelection() posts to UI thread, so we must also post the flag reset
+                                resolutionSpinner.post {
+                                    isUpdatingSpinners = false
+                                }
+                            }
+                        }
+                    },
+                    onConnectionsChanged = {
+                        runOnUiThread {
+                            updateConnectionsUI()
+                            updateFpsDisplay()
                         }
                     }
+                )
+
+                // Initial UI load - set flag to prevent spinner listeners from triggering
+                isUpdatingSpinners = true
+                try {
+                    updateUI()
+                    loadCameraOptions()
+                    loadResolutions()
+                    loadCameraOrientationOptions()
+                    loadRotationOptions()
+                    loadConnectionLimitOptions()
+                    loadOsdSettings()
+                    loadFpsSettings()
+                    loadDeviceName()
+                } finally {
+                    isUpdatingSpinners = false
+                }
+
+                // Register preview consumer if preview is expanded
+                if (isPreviewExpanded) {
+                    Log.d(TAG, "Service connected with expanded preview, registering consumer...")
+                    cameraService?.registerPreviewConsumer()
+                }
+                updatePreviewFrameSubscription()
+
+                // Start periodic metrics updates if server is running
+                if (cameraService?.isServerRunning() == true) {
+                    startMetricsUpdates()
                 }
             }
             
-            cameraService?.setOnConnectionsChangedCallback {
-                runOnUiThread {
-                    updateConnectionsUI()
-                    updateFpsDisplay()
+            override fun onServiceDisconnected(name: ComponentName?) {
+                if (serviceConnection !== this) {
+                    Log.d(TAG, "Ignoring stale onServiceDisconnected callback")
+                    return
                 }
-            }
-            
-            // Initial UI load - set flag to prevent spinner listeners from triggering
-            isUpdatingSpinners = true
-            try {
+
+                serviceCallbackToken = null
+                clearPreviewFrame()
+                cameraService = null
+                hasActiveServiceBinding = false
+                serviceBindingState = ServiceBindingState.UNBOUND
+                serviceConnection = null
+                isUpdatingSpinners = true
+                try {
+                    loadCameraOptions()
+                    loadResolutions()
+                } finally {
+                    isUpdatingSpinners = false
+                }
                 updateUI()
-                loadResolutions()
-                loadCameraOrientationOptions()
-                loadRotationOptions()
-                loadConnectionLimitOptions()
-                loadOsdSettings()
-                loadFpsSettings()
-                loadDeviceName()
-            } finally {
-                isUpdatingSpinners = false
+                stopMetricsUpdates()
             }
-            
-            // Register preview consumer if preview is expanded
-            if (isPreviewExpanded) {
-                Log.d(TAG, "Service connected with expanded preview, registering consumer...")
-                cameraService?.registerPreviewConsumer()
+
+            override fun onBindingDied(name: ComponentName?) {
+                if (serviceConnection !== this) {
+                    Log.d(TAG, "Ignoring stale onBindingDied callback")
+                    return
+                }
+
+                serviceCallbackToken = null
+                clearPreviewFrame()
+                cameraService = null
+                hasActiveServiceBinding = false
+                serviceBindingState = ServiceBindingState.UNBOUND
+                serviceConnection = null
+                stopMetricsUpdates()
+                updateUI()
             }
-            updatePreviewFrameSubscription()
-            
-            // Start periodic metrics updates if server is running
-            if (cameraService?.isServerRunning() == true) {
-                startMetricsUpdates()
+
+            override fun onNullBinding(name: ComponentName?) {
+                if (serviceConnection !== this) {
+                    Log.d(TAG, "Ignoring stale onNullBinding callback")
+                    return
+                }
+
+                serviceCallbackToken = null
+                cameraService = null
+                hasActiveServiceBinding = false
+                serviceBindingState = ServiceBindingState.UNBOUND
+                serviceConnection = null
+                stopMetricsUpdates()
+                updateUI()
             }
-        }
-        
-        override fun onServiceDisconnected(name: ComponentName?) {
-            cameraService?.clearCallbacks()
-            clearPreviewFrame()
-            cameraService = null
-            isServiceBound = false
-            updateUI()
-            // Stop metrics updates when service disconnects
-            stopMetricsUpdates()
         }
     }
     
@@ -360,11 +425,11 @@ class MainActivity : AppCompatActivity() {
         serverStatusText = findViewById(R.id.serverStatusText)
         serverUrlText = findViewById(R.id.serverUrlText)
         cameraSelectionText = findViewById(R.id.cameraSelectionText)
+        cameraSpinner = findViewById(R.id.cameraSpinner)
         endpointsText = findViewById(R.id.endpointsText)
         resolutionSpinner = findViewById(R.id.resolutionSpinner)
         cameraOrientationSpinner = findViewById(R.id.cameraOrientationSpinner)
         rotationSpinner = findViewById(R.id.rotationSpinner)
-        switchCameraButton = findViewById(R.id.switchCameraButton)
         flashlightButton = findViewById(R.id.flashlightButton)
         startStopButton = findViewById(R.id.startStopButton)
         autoStartCheckBox = findViewById(R.id.autoStartCheckBox)
@@ -470,6 +535,7 @@ class MainActivity : AppCompatActivity() {
         versionInfoText.text = BuildInfo.getFullVersionString()
         
         setupEndpointsText()
+        setupCameraSpinner()
         setupResolutionSpinner()
         setupCameraOrientationSpinner()
         setupRotationSpinner()
@@ -480,10 +546,6 @@ class MainActivity : AppCompatActivity() {
         setupDeviceNameControls()
         setupUpdateControls()
         setupDeviceOwnerCheck()
-        
-        switchCameraButton.setOnClickListener {
-            switchCamera()
-        }
         
         flashlightButton.setOnClickListener {
             toggleFlashlight()
@@ -548,7 +610,7 @@ class MainActivity : AppCompatActivity() {
             allPermissionsGranted = hasCameraPermission && hasNotificationPermission
             
             // Bind to service if not already bound
-            if (allPermissionsGranted && !isServiceBound) {
+            if (allPermissionsGranted && !hasActiveServiceBinding) {
                 Log.i(TAG, "Binding to CameraService to display camera state")
                 startCameraServiceForPreview()
             }
@@ -586,25 +648,46 @@ class MainActivity : AppCompatActivity() {
     private fun startCameraServiceForPreview() {
         // Start the service to enable camera preview, but don't necessarily start the HTTP server
         // The service will run in foreground mode and provide camera frames to the preview
-        if (!isServiceBound) {
-            Log.d("MainActivity", "Starting camera service for preview only")
-            val intent = Intent(this, CameraService::class.java)
-            startAndBindService(intent)
-        } else {
-            Log.d("MainActivity", "Camera service already bound, skipping start")
-        }
+        val intent = Intent(this, CameraService::class.java)
+        ensureServiceBinding(intent, startService = true, reason = "preview")
     }
-    
-    private fun startAndBindService(intent: Intent) {
-        ContextCompat.startForegroundService(this, intent)
-        bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+
+    private fun ensureServiceBinding(intent: Intent, startService: Boolean, reason: String) {
+        if (startService) {
+            ContextCompat.startForegroundService(this, intent)
+        }
+
+        if (hasActiveServiceBinding || serviceBindingState != ServiceBindingState.UNBOUND) {
+            Log.d(TAG, "Skipping bind for $reason: state=$serviceBindingState, hasActiveBinding=$hasActiveServiceBinding")
+            return
+        }
+
+        serviceBindingState = ServiceBindingState.BINDING
+        val connection = createServiceConnection()
+        serviceConnection = connection
+        val bound = try {
+            bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        } catch (e: Exception) {
+            Log.d(TAG, "bindService failed for $reason: ${e.message}")
+            false
+        }
+
+        if (bound) {
+            hasActiveServiceBinding = true
+            Log.d(TAG, "bindService started for $reason")
+        } else {
+            serviceConnection = null
+            hasActiveServiceBinding = false
+            serviceBindingState = ServiceBindingState.UNBOUND
+        }
     }
     
     private fun setupEndpointsText() {
         val endpoints = """
             ${getString(R.string.endpoint_snapshot)}
             ${getString(R.string.endpoint_stream)}
-            ${getString(R.string.endpoint_switch)}
+            ${getString(R.string.endpoint_cameras)}
+            ${getString(R.string.endpoint_select_camera)}
             ${getString(R.string.endpoint_status)}
             ${getString(R.string.endpoint_formats)}
             ${getString(R.string.endpoint_set_format)}
@@ -818,6 +901,45 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
     
+    private fun setupCameraSpinner() {
+        cameraSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
+                if (isUpdatingSpinners) return
+
+                val service = cameraService ?: return
+                val selectedOption = cameraOptions.getOrNull(position) ?: return
+                if (selectedOption.cameraId == service.getSelectedCameraId()) {
+                    return
+                }
+
+                service.selectCamera(selectedOption.cameraId)
+            }
+
+            override fun onNothingSelected(parent: AdapterView<*>?) {
+                // Do nothing
+            }
+        }
+    }
+
+    private fun loadCameraOptions() {
+        val service = cameraService
+        cameraOptions = service?.getAvailableCameras() ?: emptyList()
+
+        val items = if (cameraOptions.isEmpty()) {
+            listOf(getString(R.string.camera_unavailable))
+        } else {
+            cameraOptions.map { it.displayName }
+        }
+
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, items)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        cameraSpinner.adapter = adapter
+
+        val selectedCameraId = service?.getSelectedCameraId()
+        val selectedIndex = cameraOptions.indexOfFirst { it.cameraId == selectedCameraId }
+        cameraSpinner.setSelection(if (selectedIndex >= 0) selectedIndex else 0)
+    }
+
     private fun setupResolutionSpinner() {
         resolutionSpinner.onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
             override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
@@ -1288,21 +1410,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
-    private fun switchCamera() {
-        val currentCamera = cameraService?.getCurrentCamera() ?: CameraSelector.DEFAULT_BACK_CAMERA
-        val newCamera = if (currentCamera == CameraSelector.DEFAULT_BACK_CAMERA) {
-            CameraSelector.DEFAULT_FRONT_CAMERA
-        } else {
-            CameraSelector.DEFAULT_BACK_CAMERA
-        }
-        
-        cameraService?.switchCamera(newCamera)
-        updateUI()
-        loadResolutions()
-        loadCameraOrientationOptions()
-        loadRotationOptions()
-    }
-    
     private fun toggleFlashlight() {
         val service = cameraService ?: return
         
@@ -1356,8 +1463,8 @@ class MainActivity : AppCompatActivity() {
         intent.putExtra(CameraService.EXTRA_START_SERVER, true)
         
         // Bind if not already bound
-        if (!isServiceBound) {
-            startAndBindService(intent)
+        if (!hasActiveServiceBinding) {
+            ensureServiceBinding(intent, startService = true, reason = "startServer")
         } else {
             // Service already bound, just send command to start server
             ContextCompat.startForegroundService(this, intent)
@@ -1393,12 +1500,7 @@ class MainActivity : AppCompatActivity() {
             cameraService?.getServerUrl() ?: "Not available"
         )
         
-        val currentCamera = cameraService?.getCurrentCamera()
-        val cameraName = when {
-            currentCamera == null -> "Not available"
-            currentCamera == CameraSelector.DEFAULT_BACK_CAMERA -> getString(R.string.camera_back)
-            else -> getString(R.string.camera_front)
-        }
+        val cameraName = cameraService?.getSelectedCameraLabel() ?: getString(R.string.camera_unavailable)
         cameraSelectionText.text = getString(R.string.camera_selection, cameraName)
         
         startStopButton.text = if (isRunning) {
@@ -1411,7 +1513,7 @@ class MainActivity : AppCompatActivity() {
         startStopButton.isEnabled = isRunning || hasCameraPermission
         
         // Camera controls: enabled when camera service is available (bound)
-        switchCameraButton.isEnabled = isCameraAvailable
+        cameraSpinner.isEnabled = isCameraAvailable && cameraOptions.isNotEmpty()
         resolutionSpinner.isEnabled = isCameraAvailable
         cameraOrientationSpinner.isEnabled = isCameraAvailable
         rotationSpinner.isEnabled = isCameraAvailable
@@ -1431,14 +1533,9 @@ class MainActivity : AppCompatActivity() {
     override fun onResume() {
         super.onResume()
         // Rebind to service if it's running
-        if (!isServiceBound && cameraService == null) {
+        if (!hasActiveServiceBinding && cameraService == null) {
             val intent = Intent(this, CameraService::class.java)
-            try {
-                bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
-            } catch (e: Exception) {
-                // Service not running, which is fine
-                Log.d("MainActivity", "Service not available in onResume: ${e.message}")
-            }
+            ensureServiceBinding(intent, startService = false, reason = "onResume")
         }
         updateUI()
         // Start periodic metrics updates
@@ -1449,6 +1546,11 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         // Stop periodic metrics updates when activity is paused
         stopMetricsUpdates()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        releaseServiceBinding("onStop")
     }
     
     override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
@@ -1509,8 +1611,9 @@ class MainActivity : AppCompatActivity() {
 
     private fun updatePreviewFrameSubscription() {
         val service = cameraService ?: return
+        val callbackToken = serviceCallbackToken ?: return
         if (isPreviewExpanded) {
-            service.setOnFrameAvailableCallback { bitmap ->
+            service.setPreviewFrameCallback(callbackToken) { bitmap ->
                 runOnUiThread {
                     val previousBitmap = currentPreviewBitmap
                     currentPreviewBitmap = bitmap
@@ -1521,7 +1624,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } else {
-            service.setOnFrameAvailableCallback(null)
+            service.setPreviewFrameCallback(callbackToken, null)
             clearPreviewFrame()
         }
     }
@@ -1660,20 +1763,38 @@ class MainActivity : AppCompatActivity() {
     
     override fun onDestroy() {
         super.onDestroy()
-        cameraService?.setOnFrameAvailableCallback(null)
-        clearPreviewFrame()
-        // Unregister preview consumer if it was registered
-        if (isPreviewExpanded) {
-            Log.d(TAG, "Activity destroying with expanded preview, unregistering consumer...")
-            cameraService?.unregisterPreviewConsumer()
-        }
-        if (isServiceBound) {
-            cameraService?.clearCallbacks()
-            unbindService(serviceConnection)
-            isServiceBound = false
-        }
+        releaseServiceBinding("onDestroy")
         // Stop metrics updates
         stopMetricsUpdates()
+    }
+
+    private fun releaseServiceBinding(reason: String) {
+        val service = cameraService
+        val callbackToken = serviceCallbackToken
+        val activeConnection = serviceConnection
+        if (service != null) {
+            if (isPreviewExpanded) {
+                Log.d(TAG, "Releasing expanded preview consumer ($reason)")
+                service.unregisterPreviewConsumer()
+            }
+            if (callbackToken != null) {
+                service.setPreviewFrameCallback(callbackToken, null)
+                service.clearActivityCallbacks(callbackToken)
+            }
+        }
+
+        clearPreviewFrame()
+
+        if (hasActiveServiceBinding && activeConnection != null) {
+            runCatching { unbindService(activeConnection) }
+                .onFailure { Log.w(TAG, "unbindService failed during $reason", it) }
+        }
+
+        cameraService = null
+        serviceConnection = null
+        serviceCallbackToken = null
+        hasActiveServiceBinding = false
+        serviceBindingState = ServiceBindingState.UNBOUND
     }
     
     /**

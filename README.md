@@ -10,7 +10,7 @@ IP_Cam transforms your Android phone or tablet into a fully-featured IP camera a
 - **Web Interface:** Browser-based control and live viewing
 - **REST API:** Simple HTTP endpoints for automation
 - **24/7 Operation:** Foreground service with auto-restart and wake locks
-- **Multiple Cameras:** Switch between front and back cameras
+- **Multiple Cameras:** Select specific camera IDs from the available device cameras
 - **Real-time Updates:** Server-Sent Events (SSE) for live status
 - **Universal Compatibility:** Works with all major surveillance systems
 - **Auto Updates (OTA):** Automatic over-the-air updates via GitHub Releases
@@ -38,7 +38,8 @@ IP_Cam transforms your Android phone or tablet into a fully-featured IP camera a
 | `GET /stream` | MJPEG video stream |
 | `GET /snapshot` | Single JPEG image |
 | `GET /status` | JSON status information |
-| `GET /switch` | Switch camera (front/back) |
+| `GET /cameras` | List available camera IDs, labels, and capabilities |
+| `GET /selectCamera?cameraId=ID` | Select a specific camera by camera ID |
 | `GET /resetCamera` | Reset camera service (recovery from frozen states) |
 | `GET /checkUpdate` | Check for app updates |
 | `GET /triggerUpdate` | Download and install update |

@@ -483,7 +483,7 @@ class MultiCameraManager {
     private val cameras = mutableMapOf<String, CameraBinding>()
     
     fun bindCamera(cameraId: String): CameraBinding
-    fun switchCamera(cameraId: String)
+    fun selectCamera(cameraId: String)
     fun listAvailableCameras(): List<CameraInfo>
 }
 ```
@@ -492,7 +492,7 @@ class MultiCameraManager {
 ```
 GET /cameras - List available cameras
 GET /camera/{id}/stream - Stream from specific camera
-GET /camera/{id}/switch - Switch to camera
+GET /selectCamera?cameraId={id} - Switch to camera
 ```
 
 **Complexity:** High  

@@ -115,7 +115,7 @@ Camera (YUV_420_888) → Rotation → YUV-to-Bitmap → JPEG Compression → Net
 - Visual indicators for server state
 - Device name configuration
 - Format selection with live preview
-- Clear action buttons (Start/Stop Server, Switch Camera)
+- Clear action controls (Start/Stop Server, Camera Selection)
 
 **Design Principles:**
 - Information hierarchy (most important always visible)

@@ -1,5 +1,6 @@
 package com.ipcam
 
+import android.annotation.SuppressLint
 import android.app.admin.DeviceAdminReceiver
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
@@ -53,6 +54,7 @@ class DeviceAdminReceiver : DeviceAdminReceiver() {
          * @param context Application context
          * @return true if reboot was initiated, false if not Device Owner
          */
+        @SuppressLint("MissingPermission")
         fun rebootDevice(context: Context): Boolean {
             try {
                 val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager

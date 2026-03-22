@@ -223,7 +223,7 @@ Check Health → Detect Failure → Exponential Backoff → Restart Component �
 **Storage:** SharedPreferences
 
 **Persisted Settings:**
-- Camera selection (front/back)
+- Camera selection by specific `cameraId`
 - Resolution format
 - Rotation angle
 - Flashlight state
@@ -269,13 +269,13 @@ cameraProvider.bindToLifecycle(
 - Processing: CPU-based conversion to Bitmap/JPEG
 - Distribution: Callbacks to multiple consumers
 
-### Camera Switching
+### Camera Selection
 
-**Support:** Front and back cameras
+**Support:** All bindable device cameras exposed by CameraX/Camera2
 
 **Implementation:**
 - Unbind current camera
-- Switch CameraSelector
+- Resolve the selected `cameraId`
 - Rebind to new camera
 - Update all consumers
 
@@ -304,7 +304,8 @@ cameraProvider.bindToLifecycle(
 - `GET /snapshot` - Single JPEG frame
 - `GET /status` - JSON status (camera, connections, settings)
 - `GET /events` - Server-Sent Events (SSE) for real-time updates
-- `GET /switch` - Switch camera
+- `GET /cameras` - List available cameras
+- `GET /selectCamera?cameraId=<ID>` - Select a specific camera
 - `GET /toggleFlashlight` - Toggle flashlight
 - `GET /setRotation?value=<0|90|180|270|auto>` - Set rotation
 - `GET /setFormat?value=<WIDTHxHEIGHT>` - Set resolution
@@ -328,7 +329,7 @@ cameraProvider.bindToLifecycle(
 **Features:**
 - Live MJPEG stream with auto-reconnect
 - Real-time connection count (SSE updates)
-- Camera switch button
+- Camera selection dropdown
 - Flashlight toggle
 - Format/rotation controls
 - Responsive design (mobile/desktop)

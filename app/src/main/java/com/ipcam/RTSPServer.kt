@@ -43,6 +43,12 @@ class RTSPServer(
     initialBitrateMode: String = "VBR",
     private val cameraService: CameraService? = null // Optional reference for FPS tracking
 ) {
+    private enum class CodecConfigState {
+        INVALID,
+        WAITING,
+        READY
+    }
+
     private var serverSocket: ServerSocket? = null
     private val sessions = ConcurrentHashMap<String, RTSPSession>()
     private val sessionIdCounter = AtomicInteger(0)
@@ -57,6 +63,7 @@ class RTSPServer(
     // stays symmetric even when clients disconnect mid-handshake.
     private val cameraLeaseSessions = LinkedHashSet<String>()
     private val cameraLeaseLock = Any()
+    private val codecConfigLock = Any()
     
     // Synchronization lock for start/stop operations
     private val serverLock = Any()
@@ -66,6 +73,7 @@ class RTSPServer(
     @Volatile private var lastError: String? = null
     @Volatile private var sps: ByteArray? = null
     @Volatile private var pps: ByteArray? = null
+    @Volatile private var codecConfigState: CodecConfigState = CodecConfigState.INVALID
     @Volatile private var encoderColorFormat: Int = -1
     @Volatile private var encoderColorFormatName: String = "unknown"
     
@@ -137,6 +145,29 @@ class RTSPServer(
     )
 
     private fun normalizeBitrateMode(mode: String): String = mode.uppercase()
+
+    private fun getReadyCodecConfig(): Pair<ByteArray, ByteArray>? {
+        synchronized(codecConfigLock) {
+            val currentSps = sps
+            val currentPps = pps
+            if (codecConfigState != CodecConfigState.READY || currentSps == null || currentPps == null) {
+                return null
+            }
+            return currentSps to currentPps
+        }
+    }
+
+    fun invalidateCodecConfig(reason: String) {
+        synchronized(codecConfigLock) {
+            sps = null
+            pps = null
+            codecConfigState = CodecConfigState.INVALID
+            frameCount.set(0)
+            droppedFrameCount.set(0)
+            streamStartTimeMs = 0
+        }
+        Log.d(TAG, "RTSP codec config invalidated ($reason)")
+    }
 
     /**
      * RTSP session for a connected client
@@ -639,21 +670,34 @@ class RTSPServer(
         // Wait briefly for SPS/PPS to be available (encoder needs to start first)
         var retries = 0
         val maxRetries = 150 // 150 * 100ms = 15 seconds max wait
-        while ((sps == null || pps == null) && retries < maxRetries) {
+        while (getReadyCodecConfig() == null && retries < maxRetries) {
             if (retries % 10 == 0) {
-                Log.d(TAG, "Waiting for SPS/PPS... attempt ${retries}/${maxRetries}, frames=${frameCount.get()}, leases=${cameraLeaseSessions.size}")
+                Log.d(
+                    TAG,
+                    "Waiting for SPS/PPS... attempt ${retries}/${maxRetries}, " +
+                        "frames=${frameCount.get()}, leases=${cameraLeaseSessions.size}, state=$codecConfigState"
+                )
             }
             kotlinx.coroutines.delay(100)
             retries++
         }
         
-        if (sps == null || pps == null) {
-            Log.w(TAG, "SPS/PPS not available after ${retries * 100}ms. Frames=${frameCount.get()}, leases=${cameraLeaseSessions.size}")
+        val codecConfig = getReadyCodecConfig()
+        if (codecConfig == null) {
+            Log.w(
+                TAG,
+                "SPS/PPS not available after ${retries * 100}ms. " +
+                    "Frames=${frameCount.get()}, leases=${cameraLeaseSessions.size}, state=$codecConfigState"
+            )
             writer.write("RTSP/1.0 500 Internal Server Error\r\n")
             writer.write("CSeq: $cseq\r\n")
             writer.write("Content-Type: text/plain\r\n")
             writer.write("\r\n")
-            writer.write("Encoder session not ready. SPS=${sps != null}, PPS=${pps != null}, Frames=${frameCount.get()}. Please ensure camera is streaming.\r\n")
+            writer.write(
+                "Encoder session not ready. State=$codecConfigState, " +
+                    "SPS=${sps != null}, PPS=${pps != null}, Frames=${frameCount.get()}. " +
+                    "Please ensure camera is streaming.\r\n"
+            )
             writer.flush()
             return
         }
@@ -661,8 +705,9 @@ class RTSPServer(
         Log.i(TAG, "SPS/PPS available after ${retries * 100}ms, generating SDP")
         
         // Generate SDP (Session Description Protocol)
-        val spsBase64 = android.util.Base64.encodeToString(sps!!, android.util.Base64.NO_WRAP)
-        val ppsBase64 = android.util.Base64.encodeToString(pps!!, android.util.Base64.NO_WRAP)
+        val (readySps, readyPps) = codecConfig
+        val spsBase64 = android.util.Base64.encodeToString(readySps, android.util.Base64.NO_WRAP)
+        val ppsBase64 = android.util.Base64.encodeToString(readyPps, android.util.Base64.NO_WRAP)
         
         val sdp = """
             v=0
@@ -856,20 +901,26 @@ class RTSPServer(
         // Parse SPS and PPS from codec config
         val nalUnits = parseNALUnitsFromBuffer(configData)
         
-        nalUnits.forEach { nal ->
-            if (nal.isEmpty()) return@forEach
-            val nalType = nal[0].toInt() and 0x1F
-            when (nalType) {
-                7 -> {
-                    // SPS (Sequence Parameter Set)
-                    sps = nal
-                    Log.i(TAG, "SPS updated from pre-encoded stream: ${nal.size} bytes")
+        synchronized(codecConfigLock) {
+            nalUnits.forEach { nal ->
+                if (nal.isEmpty()) return@forEach
+                val nalType = nal[0].toInt() and 0x1F
+                when (nalType) {
+                    7 -> {
+                        // SPS (Sequence Parameter Set)
+                        sps = nal
+                        Log.i(TAG, "SPS updated from pre-encoded stream: ${nal.size} bytes")
+                    }
+                    8 -> {
+                        // PPS (Picture Parameter Set)
+                        pps = nal
+                        Log.i(TAG, "PPS updated from pre-encoded stream: ${nal.size} bytes")
+                    }
                 }
-                8 -> {
-                    // PPS (Picture Parameter Set)
-                    pps = nal
-                    Log.i(TAG, "PPS updated from pre-encoded stream: ${nal.size} bytes")
-                }
+            }
+
+            if (sps != null && pps != null) {
+                codecConfigState = CodecConfigState.READY
             }
         }
     }
@@ -1052,8 +1103,7 @@ class RTSPServer(
      * Cleanup resources
      */
     private fun cleanup() {
-        sps = null
-        pps = null
+        invalidateCodecConfig("server cleanup")
     }
     
     /**
@@ -1168,11 +1218,14 @@ class RTSPServer(
         targetFps = session.targetFps
         bitrate = session.bitrate
         bitrateModeName = normalizeBitrateMode(session.bitrateMode)
-        frameCount.set(0)
-        droppedFrameCount.set(0)
-        streamStartTimeMs = 0
-        sps = null
-        pps = null
+        synchronized(codecConfigLock) {
+            frameCount.set(0)
+            droppedFrameCount.set(0)
+            streamStartTimeMs = 0
+            sps = null
+            pps = null
+            codecConfigState = CodecConfigState.WAITING
+        }
         lastError = null
     }
 

@@ -31,9 +31,9 @@ This document specifies the complete requirements for the IP_Cam Android applica
 **Implementation:** CameraX preview with callback-based frame distribution
 
 #### FR-1.2: Camera Selection ✅ IMPLEMENTED
-**Requirement:** Support switching between front and back cameras  
-**Status:** Complete  
-**Implementation:** Button in UI and HTTP API endpoint (`/switch`)
+**Requirement:** Support selecting the active camera from the available device cameras
+**Status:** Complete
+**Implementation:** Camera dropdown in UI and HTTP endpoints (`/cameras`, `/selectCamera?cameraId=ID`)
 
 #### FR-1.3: Resolution Configuration ✅ IMPLEMENTED
 **Requirement:** Allow user to select from available camera resolutions  
@@ -41,8 +41,8 @@ This document specifies the complete requirements for the IP_Cam Android applica
 **Implementation:** Web UI dropdown with supported formats
 
 #### FR-1.4: Flashlight Control ✅ IMPLEMENTED
-**Requirement:** Toggle flashlight for back camera  
-**Status:** Complete  
+**Requirement:** Toggle flashlight for the selected camera when torch hardware is available
+**Status:** Complete
 **Implementation:** In-app button and HTTP API (`/toggleFlashlight`)
 
 #### FR-1.5: Rotation Control ✅ IMPLEMENTED
@@ -90,7 +90,7 @@ This document specifies the complete requirements for the IP_Cam Android applica
 **Status:** Complete  
 **Features:**
 - Live MJPEG stream display
-- Camera switch button
+- Camera selection dropdown
 - Flashlight toggle
 - Format/rotation controls
 - Real-time connection count
@@ -324,7 +324,8 @@ This document specifies the complete requirements for the IP_Cam Android applica
 | `/snapshot` | GET | Single JPEG frame | ✅ |
 | `/status` | GET | JSON status | ✅ |
 | `/events` | GET | SSE real-time updates | ✅ |
-| `/switch` | GET | Switch camera | ✅ |
+| `/cameras` | GET | List available cameras | ✅ |
+| `/selectCamera` | GET | Select a specific camera by `cameraId` | ✅ |
 | `/toggleFlashlight` | GET | Toggle flashlight | ✅ |
 | `/setRotation` | GET | Set rotation | ✅ |
 | `/setFormat` | GET | Set resolution | ✅ |

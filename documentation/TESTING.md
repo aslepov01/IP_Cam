@@ -82,10 +82,10 @@ This document provides comprehensive testing procedures and guidelines for the I
 **Procedure:**
 1. Start server
 2. Open web interface
-3. Click "Switch Camera" button
-4. Observe stream switches from back to front (or vice versa)
+3. Choose a different camera in the dropdown and apply the selection
+4. Observe stream switches to the selected camera
 5. Verify app preview also switches
-6. Click button again to switch back
+6. Select the original camera again in the dropdown
 
 **Expected Results:**
 - ✅ Camera switches within 1 second
@@ -96,18 +96,18 @@ This document provides comprehensive testing procedures and guidelines for the I
 #### Test 3: Flashlight Control
 
 **Procedure:**
-1. Ensure back camera is active
+1. Ensure a camera with flash support is active
 2. Click "Toggle Flashlight" in web UI
 3. Verify flashlight turns on
 4. Click again to turn off
-5. Switch to front camera
-6. Verify flashlight button is disabled or shows error
+5. Switch to a camera without flash support
+6. Verify flashlight button is disabled or the API returns an error
 
 **Expected Results:**
-- ✅ Flashlight toggles on/off for back camera
+- ✅ Flashlight toggles on/off for a camera with flash support
 - ✅ Visual confirmation (flashlight LED on device)
-- ✅ Graceful handling for front camera (no flashlight)
-- ✅ State persists across camera switches (back → front → back)
+- ✅ Graceful handling for a camera without flash support
+- ✅ State persists across camera switches (flash-capable → no-flash → flash-capable)
 
 #### Test 4: Snapshot Capture
 
@@ -258,10 +258,10 @@ pkill -f "curl.*stream"
 
 **Procedure:**
 1. Start server
-2. Switch to front camera
+2. Select a non-default camera
 3. Change resolution
 4. Set rotation to 90°
-5. Enable flashlight (if back camera)
+5. Enable flashlight if the selected camera supports it
 6. Force stop app: `adb shell am force-stop com.example.ipcam`
 7. Reopen app
 8. Start server again
@@ -458,12 +458,16 @@ else
     echo "❌ Snapshot failed"
 fi
 
-# Test camera switch
-echo -e "\n3. Testing /switch..."
-curl -s "${BASE_URL}/switch" | jq .
+# Test camera selection
+echo -e "\n3. Testing /cameras..."
+curl -s "${BASE_URL}/cameras" | jq .
+
+echo -e "\n4. Testing /selectCamera..."
+FIRST_CAMERA_ID=$(curl -s "${BASE_URL}/cameras" | jq -r '.cameras[0].id')
+curl -s "${BASE_URL}/selectCamera?cameraId=${FIRST_CAMERA_ID}" | jq .
 
 # Test flashlight toggle
-echo -e "\n4. Testing /toggleFlashlight..."
+echo -e "\n5. Testing /toggleFlashlight..."
 curl -s "${BASE_URL}/toggleFlashlight" | jq .
 
 # Test rotation
