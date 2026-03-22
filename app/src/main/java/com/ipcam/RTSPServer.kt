@@ -1,11 +1,9 @@
 package com.ipcam
 
-import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.util.Log
-import androidx.camera.core.ImageProxy
 import com.ipcam.InMemoryLogBuffer
 import kotlinx.coroutines.*
 import java.io.*
@@ -16,7 +14,6 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
-import java.nio.ByteBuffer
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -28,7 +25,7 @@ import java.util.concurrent.atomic.AtomicLong
  * Implementation follows RTSP_RECOMMENDATION.md architecture:
  * - RTSP protocol handler (DESCRIBE, SETUP, PLAY, TEARDOWN)
  * - RTP packetizer for H.264 NAL units
- * - MediaCodec hardware encoder integration
+ * - MediaCodec surface-input encoder integration
  * - Multi-client session management
  * 
  * Industry standard for IP cameras compatible with:
@@ -41,16 +38,15 @@ class RTSPServer(
     private val port: Int = 8554, // Standard RTSP port
     private var width: Int = 1920,
     private var height: Int = 1080,
-    private val fps: Int = 30,
+    initialFps: Int = 30,
     initialBitrate: Int = calculateBitrate(width, height), // Dynamic based on resolution
+    initialBitrateMode: String = "VBR",
     private val cameraService: CameraService? = null // Optional reference for FPS tracking
 ) {
     private var serverSocket: ServerSocket? = null
-    private var encoder: MediaCodec? = null
     private val sessions = ConcurrentHashMap<String, RTSPSession>()
     private val sessionIdCounter = AtomicInteger(0)
     private val isRunning = AtomicBoolean(false)
-    private val isEncoding = AtomicBoolean(false)
     private val frameCount = AtomicLong(0)
     private val droppedFrameCount = AtomicLong(0)
     private var serverJob: Job? = null
@@ -74,26 +70,15 @@ class RTSPServer(
     @Volatile private var encoderColorFormatName: String = "unknown"
     
     // Encoder configuration (mutable for runtime changes)
+    @Volatile private var targetFps: Int = initialFps
     @Volatile private var bitrate: Int = initialBitrate
-    @Volatile private var bitrateMode: Int = MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
-    @Volatile private var bitrateModeName: String = "VBR"
+    @Volatile private var bitrateModeName: String = normalizeBitrateMode(initialBitrateMode)
     
     // Frame timing control
-    @Volatile private var lastFrameTimeNs: Long = 0
-    @Volatile private var lastQueueFullLogTimeMs: Long = 0
-    private val logThrottleMs = 5000L // Log at most every 5 seconds
     @Volatile private var streamStartTimeMs: Long = 0
-    @Volatile private var streamStartTimeNs: Long = 0 // For high-precision timestamp calculations
-    
-    // Reusable buffers
-    private var yDataBuffer: ByteArray? = null
-    private var uvDataBuffer: ByteArray? = null
-    private var yRowBuffer: ByteArray? = null
-    private var uvRowBuffer: ByteArray? = null
     
     companion object {
         private const val TAG = "RTSPServer"
-        private const val TIMEOUT_US = 0L  // Non-blocking: return immediately if no buffer available
         private const val RTP_VERSION = 2
         private const val RTP_PT_H264 = 96 // Dynamic payload type for H.264
         
@@ -140,7 +125,19 @@ class RTSPServer(
         }
 
     }
-    
+
+    data class EncoderSession(
+        val encoderName: String,
+        val isHardware: Boolean,
+        val colorFormat: Int,
+        val colorFormatName: String,
+        val targetFps: Int,
+        val bitrate: Int,
+        val bitrateMode: String
+    )
+
+    private fun normalizeBitrateMode(mode: String): String = mode.uppercase()
+
     /**
      * RTSP session for a connected client
      */
@@ -349,10 +346,7 @@ class RTSPServer(
                 if (attempt == 1) {
                     detectEncoderCapabilities()
                 }
-                
-                // Mark encoding as enabled (encoder will be created on first frame)
-                isEncoding.set(true)
-                
+
                 // Create server socket with SO_REUSEADDR to allow binding to recently closed sockets
                 Log.d(TAG, "RTSP server bind attempt $attempt/$maxAttempts on port $port")
                 serverSocket = createServerSocket(port)
@@ -365,14 +359,13 @@ class RTSPServer(
                 
                 Log.i(TAG, "RTSP server started on port $port")
                 Log.i(TAG, "Encoder: $encoderName (hardware: $isHardwareEncoder), Color format: $encoderColorFormatName")
-                Log.i(TAG, "Encoder will be initialized on first frame")
+                Log.i(TAG, "Encoder session will start when an RTSP client activates the camera lease")
                 
                 return true
                 
             } catch (e: BindException) {
                 Log.w(TAG, "RTSP server bind attempt $attempt/$maxAttempts failed: ${e.message}")
                 lastError = "Bind failed (attempt $attempt/$maxAttempts): ${e.message}"
-                isEncoding.set(false)
                 
                 // If this was not the last attempt, wait before retry
                 if (attempt < maxAttempts) {
@@ -392,7 +385,6 @@ class RTSPServer(
                 Log.e(TAG, "Failed to start RTSP server on attempt $attempt", e)
                 lastError = "Server start failed: ${e.message}"
                 InMemoryLogBuffer.add("E", TAG, "RTSP server start failed on attempt $attempt: ${e.message}")
-                isEncoding.set(false)
                 cleanup()
                 return false
             }
@@ -440,44 +432,17 @@ class RTSPServer(
                     encoderName = codecInfo.name
                     isHardwareEncoder = true
                     
-                    // Detect color format
+                    // Surface input is the active encoder architecture.
                     val capabilities = codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                    val colorFormats = capabilities.colorFormats
-                    
-                    Log.d(TAG, "Available color formats for $encoderName:")
-                    colorFormats.forEach { format ->
-                        Log.d(TAG, "  - ${getColorFormatName(format)} (0x${Integer.toHexString(format)})")
+                    val colorFormats = capabilities.colorFormats.toSet()
+
+                    encoderColorFormat = MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+                    encoderColorFormatName = getColorFormatName(encoderColorFormat)
+
+                    if (!colorFormats.contains(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)) {
+                        Log.w(TAG, "Encoder $encoderName does not report COLOR_FormatSurface support explicitly")
                     }
-                    
-                    // Prefer NV12 (YUV420 semi-planar)
-                    for (format in colorFormats) {
-                        if (format == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
-                            encoderColorFormat = format
-                            encoderColorFormatName = getColorFormatName(format)
-                            Log.i(TAG, "Selected preferred format: $encoderColorFormatName")
-                            return
-                        }
-                    }
-                    
-                    // Try other supported formats
-                    for (format in colorFormats) {
-                        when (format) {
-                            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar,
-                            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible -> {
-                                encoderColorFormat = format
-                                encoderColorFormatName = getColorFormatName(format)
-                                Log.i(TAG, "Selected format: $encoderColorFormatName")
-                                return
-                            }
-                        }
-                    }
-                    
-                    // Fallback to first available
-                    if (colorFormats.isNotEmpty()) {
-                        encoderColorFormat = colorFormats[0]
-                        encoderColorFormatName = getColorFormatName(colorFormats[0])
-                        Log.w(TAG, "Using fallback format: $encoderColorFormatName")
-                    }
+                    Log.i(TAG, "Selected active RTSP input format: $encoderColorFormatName")
                     return
                 }
             }
@@ -495,220 +460,11 @@ class RTSPServer(
     }
     
     /**
-     * Initialize H.264 encoder
-     */
-    private fun initializeEncoder(): Boolean {
-        try {
-            Log.d(TAG, "Initializing encoder for ${width}x${height}")
-            encoder = selectBestEncoder()
-            
-            val colorFormat = getSupportedColorFormat()
-            if (colorFormat == -1) {
-                Log.e(TAG, "No supported color format found")
-                return false
-            }
-            
-            encoderColorFormat = colorFormat
-            encoderColorFormatName = getColorFormatName(colorFormat)
-            Log.i(TAG, "Using color format: $encoderColorFormatName (0x${Integer.toHexString(colorFormat)})")
-            
-            val format = MediaFormat.createVideoFormat(
-                MediaFormat.MIMETYPE_VIDEO_AVC,
-                width,
-                height
-            )
-            
-            format.setInteger(MediaFormat.KEY_COLOR_FORMAT, colorFormat)
-            format.setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
-            format.setInteger(MediaFormat.KEY_FRAME_RATE, fps)
-            format.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 2) // I-frame every 2 seconds
-            format.setInteger(MediaFormat.KEY_BITRATE_MODE, bitrateMode)
-            
-            // CRITICAL: Set operating rate to actually limit output framerate
-            // KEY_FRAME_RATE is just a hint for rate control, doesn't limit output
-            // KEY_OPERATING_RATE actually controls the encoding rate
-            format.setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
-            
-            // Set baseline profile for maximum compatibility
-            format.setInteger(MediaFormat.KEY_PROFILE, MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline)
-            format.setInteger(MediaFormat.KEY_LEVEL, MediaCodecInfo.CodecProfileLevel.AVCLevel31)
-            
-            Log.i(TAG, "Encoder framerate configured: KEY_FRAME_RATE=$fps, KEY_OPERATING_RATE=$fps")
-            
-            // Low-latency encoding settings for RTSP streaming
-            // These settings minimize encoder buffering and reduce latency
-            try {
-                // Request low latency mode (Android 10+)
-                format.setInteger(MediaFormat.KEY_LATENCY, 0)
-                
-                // Disable B-frames for lower latency (baseline profile doesn't use them anyway)
-                format.setInteger(MediaFormat.KEY_MAX_B_FRAMES, 0)
-                
-                // Set real-time priority for encoding (Android 10+)
-                format.setInteger(MediaFormat.KEY_PRIORITY, 0) // 0 = realtime
-                
-                Log.d(TAG, "Low-latency encoder settings applied")
-            } catch (e: Exception) {
-                // These keys may not be supported on all devices/Android versions
-                Log.d(TAG, "Some low-latency settings not supported: ${e.message}")
-            }
-            
-            Log.i(TAG, "Encoder configuration: ${width}x${height} @ ${fps}fps, bitrate=${bitrate} bps (${bitrate / 1_000_000} Mbps), mode=$bitrateModeName, format=$encoderColorFormatName")
-            Log.d(TAG, "Full MediaFormat: $format")
-            encoder?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            encoder?.start()
-            Log.i(TAG, "Encoder started successfully: $encoderName (hardware: $isHardwareEncoder)")
-            
-            // Verify encoder configuration by reading output format
-            try {
-                val outputFormat = encoder?.outputFormat
-                if (outputFormat != null) {
-                    val actualFrameRate = outputFormat.getInteger(MediaFormat.KEY_FRAME_RATE)
-                    val actualBitrate = outputFormat.getInteger(MediaFormat.KEY_BIT_RATE)
-                    val actualBitrateMode = if (outputFormat.containsKey(MediaFormat.KEY_BITRATE_MODE)) {
-                        when (outputFormat.getInteger(MediaFormat.KEY_BITRATE_MODE)) {
-                            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR -> "VBR"
-                            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR -> "CBR"
-                            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ -> "CQ"
-                            else -> "Unknown"
-                        }
-                    } else {
-                        "Not specified"
-                    }
-                    
-                    Log.i(TAG, "=== ENCODER OUTPUT FORMAT VERIFICATION ===")
-                    Log.i(TAG, "Configured FPS: $fps, Actual output FPS: $actualFrameRate")
-                    Log.i(TAG, "Configured bitrate: ${bitrate / 1_000_000}Mbps, Actual output bitrate: ${actualBitrate / 1_000_000}Mbps")
-                    Log.i(TAG, "Configured bitrate mode: $bitrateModeName, Actual output mode: $actualBitrateMode")
-                    Log.i(TAG, "Full output format: $outputFormat")
-                    Log.i(TAG, "==========================================")
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "Could not verify encoder output format: ${e.message}")
-            }
-            
-            isEncoding.set(true)
-            
-            // Reset stream start time when encoder is (re)initialized
-            // This ensures accurate FPS calculation and timestamp generation
-            // after encoder recreation (e.g., resolution changes, bitrate updates, etc.)
-            streamStartTimeMs = 0
-            streamStartTimeNs = 0
-            Log.d(TAG, "Stream start time reset for accurate FPS calculation and timestamps")
-            
-            return true
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to initialize encoder", e)
-            lastError = "Encoder init failed: ${e.message}"
-            return false
-        }
-    }
-    
-    /**
-     * Recreate encoder with new dimensions
-     */
-    private fun recreateEncoder(newWidth: Int, newHeight: Int): Boolean {
-        Log.i(TAG, "Recreating encoder with dimensions: ${newWidth}x${newHeight}")
-        
-        // Update dimensions
-        width = newWidth
-        height = newHeight
-        
-        // NOTE: Do NOT recalculate bitrate here - preserve user-set bitrate
-        // Bitrate is only auto-calculated on initial creation or when explicitly reset
-        Log.i(TAG, "Using current bitrate: $bitrate bps (${bitrate / 1_000_000} Mbps)")
-        
-        // Recreate buffers
-        yDataBuffer = null
-        uvDataBuffer = null
-        yRowBuffer = null
-        uvRowBuffer = null
-        
-        // Initialize new encoder
-        return initializeEncoder()
-    }
-    
-    /**
-     * Select best available H.264 encoder
-     */
-    private fun selectBestEncoder(): MediaCodec {
-        val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-        
-        for (codecInfo in codecList.codecInfos) {
-            if (!codecInfo.isEncoder) continue
-            if (!codecInfo.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC)) continue
-            
-            if (!codecInfo.name.contains("OMX.google", ignoreCase = true) &&
-                !codecInfo.name.contains("c2.android", ignoreCase = true)) {
-                encoderName = codecInfo.name
-                isHardwareEncoder = true
-                Log.d(TAG, "Selected hardware encoder: $encoderName")
-                return MediaCodec.createByCodecName(codecInfo.name)
-            }
-        }
-        
-        Log.w(TAG, "Hardware encoder not found, using software fallback")
-        encoderName = "software"
-        isHardwareEncoder = false
-        return MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-    }
-    
-    /**
-     * Get supported color format
-     */
-    private fun getSupportedColorFormat(): Int {
-        try {
-            val codecList = MediaCodecList(MediaCodecList.REGULAR_CODECS)
-            for (codecInfo in codecList.codecInfos) {
-                if (!codecInfo.isEncoder) continue
-                if (!codecInfo.supportedTypes.contains(MediaFormat.MIMETYPE_VIDEO_AVC)) continue
-                if (codecInfo.name != encoderName) continue
-                
-                val capabilities = codecInfo.getCapabilitiesForType(MediaFormat.MIMETYPE_VIDEO_AVC)
-                val colorFormats = capabilities.colorFormats
-                
-                Log.d(TAG, "Available color formats for $encoderName:")
-                colorFormats.forEach { format ->
-                    Log.d(TAG, "  - ${getColorFormatName(format)} (0x${Integer.toHexString(format)})")
-                }
-                
-                // Prefer NV12 (YUV420 semi-planar) as it's most common and efficient
-                for (format in colorFormats) {
-                    if (format == MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar) {
-                        Log.i(TAG, "Selected preferred format: COLOR_FormatYUV420SemiPlanar (NV12)")
-                        return format
-                    }
-                }
-                
-                // Try other supported formats
-                for (format in colorFormats) {
-                    when (format) {
-                        MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar,
-                        MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible -> {
-                            Log.i(TAG, "Selected format: ${getColorFormatName(format)}")
-                            return format
-                        }
-                    }
-                }
-                
-                // Fallback to first available format
-                if (colorFormats.isNotEmpty()) {
-                    Log.w(TAG, "Using fallback format: ${getColorFormatName(colorFormats[0])}")
-                    return colorFormats[0]
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error getting color format", e)
-        }
-        return -1
-    }
-    
-    /**
      * Get human-readable name for color format
      */
     private fun getColorFormatName(format: Int): String {
         return when (format) {
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface -> "COLOR_FormatSurface"
             MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible -> "COLOR_FormatYUV420Flexible"
             MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar -> "COLOR_FormatYUV420Planar (I420)"
             MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar -> "COLOR_FormatYUV420SemiPlanar (NV12)"
@@ -885,19 +641,19 @@ class RTSPServer(
         val maxRetries = 150 // 150 * 100ms = 15 seconds max wait
         while ((sps == null || pps == null) && retries < maxRetries) {
             if (retries % 10 == 0) {
-                Log.d(TAG, "Waiting for SPS/PPS... attempt ${retries}/${maxRetries}, encoder=${encoder != null}, encoding=${isEncoding.get()}, frames=${frameCount.get()}")
+                Log.d(TAG, "Waiting for SPS/PPS... attempt ${retries}/${maxRetries}, frames=${frameCount.get()}, leases=${cameraLeaseSessions.size}")
             }
             kotlinx.coroutines.delay(100)
             retries++
         }
         
         if (sps == null || pps == null) {
-            Log.w(TAG, "SPS/PPS not available after ${retries * 100}ms. Encoder=${encoder != null}, Encoding=${isEncoding.get()}, Frames=${frameCount.get()}")
+            Log.w(TAG, "SPS/PPS not available after ${retries * 100}ms. Frames=${frameCount.get()}, leases=${cameraLeaseSessions.size}")
             writer.write("RTSP/1.0 500 Internal Server Error\r\n")
             writer.write("CSeq: $cseq\r\n")
             writer.write("Content-Type: text/plain\r\n")
             writer.write("\r\n")
-            writer.write("Encoder not ready. SPS=${sps != null}, PPS=${pps != null}, Frames=${frameCount.get()}. Please ensure camera is streaming.\r\n")
+            writer.write("Encoder session not ready. SPS=${sps != null}, PPS=${pps != null}, Frames=${frameCount.get()}. Please ensure camera is streaming.\r\n")
             writer.flush()
             return
         }
@@ -1093,520 +849,6 @@ class RTSPServer(
     }
     
     /**
-     * Encode frame from camera
-     * 
-     * NOTE: This method is currently UNUSED in the production code.
-     * The current RTSP implementation uses H264PreviewEncoder with a Surface-based pipeline,
-     * which feeds camera frames directly to MediaCodec without going through ImageProxy.
-     * 
-     * This method is kept for potential future use or alternative encoding paths.
-     * Uses try-with-resources pattern (Kotlin's use{}) to ensure ImageProxy is always closed.
-     */
-    fun encodeFrame(image: ImageProxy): Boolean {
-        // Use Kotlin's use{} extension to ensure image.close() is always called
-        // This provides automatic resource management similar to Java's try-with-resources
-        return image.use {
-            if (!isEncoding.get()) {
-                return false
-            }
-            
-            try {
-                // === Encoder Initialization/Recreation ===
-                // Check if encoder needs to be (re)created due to resolution mismatch
-                if (encoder == null || image.width != width || image.height != height) {
-                    if (encoder != null) {
-                        Log.i(TAG, "Resolution changed from ${width}x${height} to ${image.width}x${image.height}, recreating encoder")
-                        try {
-                            encoder?.stop()
-                            encoder?.release()
-                        } catch (e: Exception) {
-                            Log.e(TAG, "Error stopping old encoder", e)
-                        }
-                        encoder = null
-                        sps = null
-                        pps = null
-                    }
-                    
-                    // Recreate encoder with actual frame dimensions
-                    if (!recreateEncoder(image.width, image.height)) {
-                        // Note: return exits the function AND automatically calls image.close() via use{}
-                        return false
-                    }
-                }
-                
-                // Log first successful frame
-                if (frameCount.get() == 0L) {
-                    Log.i(TAG, "Encoding first frame: ${image.width}x${image.height} @ ${fps} fps")
-                    streamStartTimeMs = System.currentTimeMillis()
-                    lastFrameTimeNs = System.nanoTime()
-                }
-                
-                // === Encode Frame ===
-                // Get input buffer with timeout
-                val inputBufferIndex = encoder?.dequeueInputBuffer(TIMEOUT_US) ?: -1
-                if (inputBufferIndex >= 0) {
-                    val inputBuffer = encoder?.getInputBuffer(inputBufferIndex)
-                    
-                    if (inputBuffer != null) {
-                        fillInputBuffer(inputBuffer, image)
-                        
-                        // Use actual elapsed time for presentation timestamp
-                        // This provides accurate timing for RTP timestamps
-                        val currentTimeNs = System.nanoTime()
-                        val elapsedTimeUs = if (streamStartTimeNs > 0) {
-                            // Calculate time since stream start in microseconds
-                            // Using nanoTime() for high precision and monotonic timing
-                            (currentTimeNs - streamStartTimeNs) / 1000L
-                        } else {
-                            // First frame - initialize start time and use 0
-                            streamStartTimeNs = currentTimeNs
-                            streamStartTimeMs = System.currentTimeMillis() // For FPS calculation
-                            0L
-                        }
-                        val bufferSize = inputBuffer.remaining() // Size of data after flip()
-                        
-                        // Check encoder state before queueing - avoid race condition during start()
-                        try {
-                            encoder?.queueInputBuffer(
-                                inputBufferIndex,
-                                0,
-                                bufferSize,
-                                elapsedTimeUs,
-                                0
-                            )
-                            frameCount.incrementAndGet()
-                            
-                            // Track RTSP FPS - frame successfully queued for encoding
-                            cameraService?.recordRtspFrameEncoded()
-                        } catch (e: IllegalStateException) {
-                            // Encoder not yet in EXECUTING state (still in start())
-                            // This can happen during encoder recreation - safe to drop frame
-                            // Note: return exits the function AND automatically calls image.close() via use{}
-                            Log.w(TAG, "Encoder not ready yet (during start()), dropping frame")
-                            return false
-                        }
-                        
-                        // Update timing for FPS calculation
-                        lastFrameTimeNs = System.nanoTime()
-                        
-                        if (frameCount.get() == 1L) {
-                            Log.i(TAG, "First frame queued with size: $bufferSize bytes")
-                        }
-                    }
-                } else {
-                    // Encoder input queue full - this is normal under load
-                    val currentTimeMs = System.currentTimeMillis()
-                    if (currentTimeMs - lastQueueFullLogTimeMs > logThrottleMs) {
-                        Log.d(TAG, "Encoder input buffer unavailable (queue full), ${droppedFrameCount.get()} total frames dropped")
-                        lastQueueFullLogTimeMs = currentTimeMs
-                    }
-                    droppedFrameCount.incrementAndGet()
-                    // Note: return exits the function AND automatically calls image.close() via use{}
-                    return false
-                }
-                
-                // Retrieve encoded output
-                drainEncoder()
-                
-                return true
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "Error encoding frame", e)
-                lastError = "Frame encoding failed: ${e.message}"
-                return false
-            }
-            // Note: image.close() is called automatically by use{} when this block exits
-            // This happens regardless of normal completion, early return, or exception
-        }
-    }
-    
-    /**
-     * Fill input buffer with YUV data
-     * Converts YUV_420_888 from camera to encoder's expected format (NV12/I420)
-     */
-    private fun fillInputBuffer(buffer: ByteBuffer, image: ImageProxy) {
-        try {
-            buffer.clear()
-            
-            val planes = image.planes
-            if (planes.size < 3) {
-                Log.e(TAG, "Invalid image format: expected 3 planes, got ${planes.size}")
-                return
-            }
-            
-            val yPlane = planes[0]
-            val uPlane = planes[1]
-            val vPlane = planes[2]
-            
-            // Create duplicate buffers to avoid corrupting shared ImageProxy buffers
-            val yBuffer = yPlane.buffer.duplicate()
-            val uBuffer = uPlane.buffer.duplicate()
-            val vBuffer = vPlane.buffer.duplicate()
-            
-            val yRowStride = yPlane.rowStride
-            val yPixelStride = yPlane.pixelStride
-            val uvRowStride = uPlane.rowStride
-            val uvPixelStride = uPlane.pixelStride
-            
-            // Log format details on first frame
-            if (frameCount.get() == 0L) {
-                Log.i(TAG, "YUV_420_888 format details:")
-                Log.i(TAG, "  Y: ${width}x${height}, rowStride=$yRowStride, pixelStride=$yPixelStride")
-                Log.i(TAG, "  U: ${width/2}x${height/2}, rowStride=$uvRowStride, pixelStride=$uvPixelStride")
-                Log.i(TAG, "  V: ${width/2}x${height/2}, rowStride=$uvRowStride, pixelStride=$uvPixelStride")
-                Log.i(TAG, "  Encoder expects: $encoderColorFormatName")
-            }
-            
-            // Initialize reusable buffers
-            if (yDataBuffer == null) {
-                yDataBuffer = ByteArray(width * height)
-            }
-            if (yRowBuffer == null || yRowBuffer!!.size < yRowStride) {
-                yRowBuffer = ByteArray(yRowStride)
-            }
-            
-            // === Copy Y plane ===
-            yBuffer.rewind()
-            if (yRowStride == width && yPixelStride == 1) {
-                // Contiguous Y plane - fast path
-                val ySize = width * height
-                yBuffer.get(yDataBuffer!!, 0, ySize)
-                buffer.put(yDataBuffer!!, 0, ySize)
-            } else {
-                // Non-contiguous Y plane - copy row by row
-                var destOffset = 0
-                for (row in 0 until height) {
-                    yBuffer.position(row * yRowStride)
-                    val bytesToRead = minOf(yRowStride, yBuffer.remaining())
-                    yBuffer.get(yRowBuffer!!, 0, bytesToRead)
-                    
-                    if (yPixelStride == 1) {
-                        // Packed pixels - simple copy
-                        System.arraycopy(yRowBuffer!!, 0, yDataBuffer!!, destOffset, width)
-                    } else {
-                        // Sparse pixels - extract every nth pixel
-                        for (col in 0 until width) {
-                            yDataBuffer!![destOffset + col] = yRowBuffer!![col * yPixelStride]
-                        }
-                    }
-                    destOffset += width
-                }
-                buffer.put(yDataBuffer!!, 0, width * height)
-            }
-            
-            // === Copy UV planes ===
-            val uvHeight = height / 2
-            val uvWidth = width / 2
-            
-            // Allocate local UV buffer to avoid race conditions with encoder recreation
-            val localUvBuffer = ByteArray(uvWidth * uvHeight * 2)
-            if (uvRowBuffer == null || uvRowBuffer!!.size < uvRowStride) {
-                uvRowBuffer = ByteArray(uvRowStride)
-            }
-            
-            uBuffer.rewind()
-            vBuffer.rewind()
-            
-            // Convert based on encoder's expected format
-            when (encoderColorFormat) {
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar -> {
-                    // NV12: Y plane + interleaved UV (UVUVUV...)
-                    convertToNV12(buffer, uBuffer, vBuffer, uvWidth, uvHeight, uvRowStride, uvPixelStride, localUvBuffer)
-                }
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420PackedSemiPlanar -> {
-                    // NV21: Y plane + interleaved VU (VUVUVU...)
-                    convertToNV21(buffer, uBuffer, vBuffer, uvWidth, uvHeight, uvRowStride, uvPixelStride, localUvBuffer)
-                }
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar -> {
-                    // I420: Y plane + U plane + V plane
-                    convertToI420(buffer, uBuffer, vBuffer, uvWidth, uvHeight, uvRowStride, uvPixelStride, localUvBuffer)
-                }
-                else -> {
-                    // COLOR_FormatYUV420Flexible or unknown - try NV12 as most common
-                    Log.w(TAG, "Unknown color format, assuming NV12")
-                    convertToNV12(buffer, uBuffer, vBuffer, uvWidth, uvHeight, uvRowStride, uvPixelStride, localUvBuffer)
-                }
-            }
-            
-            buffer.flip()
-            
-            if (frameCount.get() == 0L) {
-                Log.i(TAG, "Filled input buffer: ${buffer.remaining()} bytes")
-            }
-            
-        } catch (e: Exception) {
-            Log.e(TAG, "Error filling input buffer", e)
-            lastError = "Buffer fill failed: ${e.message}"
-        }
-    }
-    
-    /**
-     * Convert YUV_420_888 UV planes to NV12 format (interleaved UVUV)
-     */
-    private fun convertToNV12(
-        buffer: ByteBuffer,
-        uBuffer: ByteBuffer,
-        vBuffer: ByteBuffer,
-        uvWidth: Int,
-        uvHeight: Int,
-        uvRowStride: Int,
-        uvPixelStride: Int,
-        uvBuffer: ByteArray
-    ) {
-        var uvDestOffset = 0
-        
-        // Note: When uvPixelStride == 2, the U and V planes are already interleaved
-        // in semi-planar format, but they're in SEPARATE buffers (U has UVUV, V has VUVU)
-        // We need to extract from both or use the fact that U buffer already contains
-        // the interleaved data if the stride matches.
-        
-        // Check if U buffer already contains properly interleaved NV12 data
-        // This happens when the camera outputs NV12 directly
-        // UV planes are half the resolution of Y plane, so rowStride should be width/2 for packed UV
-        if (uvPixelStride == 2 && uvRowStride == uvWidth && uBuffer.remaining() >= uvWidth * uvHeight * 2) {
-            // U buffer contains interleaved UV data in NV12 format - fast path
-            val uvSize = uvWidth * uvHeight * 2
-            uBuffer.get(uvBuffer, 0, minOf(uvSize, uBuffer.remaining()))
-            buffer.put(uvBuffer, 0, uvSize)
-        } else {
-            // Manual interleaving required
-            for (row in 0 until uvHeight) {
-                uBuffer.position(row * uvRowStride)
-                vBuffer.position(row * uvRowStride)
-                
-                for (col in 0 until uvWidth) {
-                    // Write U sample
-                    val uPos = col * uvPixelStride
-                    if (uBuffer.position() + uPos < uBuffer.limit()) {
-                        uvBuffer[uvDestOffset++] = uBuffer.get(uBuffer.position() + uPos)
-                    } else {
-                        uvBuffer[uvDestOffset++] = 128.toByte() // Neutral chroma
-                    }
-                    
-                    // Write V sample
-                    val vPos = col * uvPixelStride
-                    if (vBuffer.position() + vPos < vBuffer.limit()) {
-                        uvBuffer[uvDestOffset++] = vBuffer.get(vBuffer.position() + vPos)
-                    } else {
-                        uvBuffer[uvDestOffset++] = 128.toByte() // Neutral chroma
-                    }
-                }
-            }
-            buffer.put(uvBuffer, 0, uvDestOffset)
-        }
-    }
-    
-    /**
-     * Convert YUV_420_888 UV planes to NV21 format (interleaved VUVU)
-     */
-    private fun convertToNV21(
-        buffer: ByteBuffer,
-        uBuffer: ByteBuffer,
-        vBuffer: ByteBuffer,
-        uvWidth: Int,
-        uvHeight: Int,
-        uvRowStride: Int,
-        uvPixelStride: Int,
-        uvBuffer: ByteArray
-    ) {
-        var uvDestOffset = 0
-        
-        // Convert to NV21 - interleave V and U (reverse of NV12)
-        for (row in 0 until uvHeight) {
-            uBuffer.position(row * uvRowStride)
-            vBuffer.position(row * uvRowStride)
-            
-            for (col in 0 until uvWidth) {
-                // Write V sample first (NV21)
-                val vPos = col * uvPixelStride
-                if (vBuffer.position() + vPos < vBuffer.limit()) {
-                    uvBuffer[uvDestOffset++] = vBuffer.get(vBuffer.position() + vPos)
-                } else {
-                    uvBuffer[uvDestOffset++] = 128.toByte()
-                }
-                
-                // Write U sample second
-                val uPos = col * uvPixelStride
-                if (uBuffer.position() + uPos < uBuffer.limit()) {
-                    uvBuffer[uvDestOffset++] = uBuffer.get(uBuffer.position() + uPos)
-                } else {
-                    uvBuffer[uvDestOffset++] = 128.toByte()
-                }
-            }
-        }
-        buffer.put(uvBuffer, 0, uvDestOffset)
-    }
-    
-    /**
-     * Convert YUV_420_888 UV planes to I420 format (planar U then V)
-     */
-    private fun convertToI420(
-        buffer: ByteBuffer,
-        uBuffer: ByteBuffer,
-        vBuffer: ByteBuffer,
-        uvWidth: Int,
-        uvHeight: Int,
-        uvRowStride: Int,
-        uvPixelStride: Int,
-        uvBuffer: ByteArray
-    ) {
-        // I420: separate U and V planes
-        var destOffset = 0
-        
-        // Copy U plane
-        for (row in 0 until uvHeight) {
-            uBuffer.position(row * uvRowStride)
-            for (col in 0 until uvWidth) {
-                val uPos = col * uvPixelStride
-                if (uBuffer.position() + uPos < uBuffer.limit()) {
-                    uvBuffer[destOffset++] = uBuffer.get(uBuffer.position() + uPos)
-                } else {
-                    uvBuffer[destOffset++] = 128.toByte()
-                }
-            }
-        }
-        
-        // Copy V plane
-        for (row in 0 until uvHeight) {
-            vBuffer.position(row * uvRowStride)
-            for (col in 0 until uvWidth) {
-                val vPos = col * uvPixelStride
-                if (vBuffer.position() + vPos < vBuffer.limit()) {
-                    uvBuffer[destOffset++] = vBuffer.get(vBuffer.position() + vPos)
-                } else {
-                    uvBuffer[destOffset++] = 128.toByte()
-                }
-            }
-        }
-        
-        buffer.put(uvBuffer, 0, destOffset)
-    }
-    
-    /**
-     * Drain encoder output
-     */
-    private fun drainEncoder() {
-        val bufferInfo = MediaCodec.BufferInfo()
-        
-        // Limit iterations to prevent blocking camera thread
-        // Process at most 3 output buffers per frame to maintain throughput
-        var iterations = 0
-        val maxIterations = 3
-        
-        // Always use non-blocking timeout to prevent camera thread blocking
-        // For first few frames, we rely on multiple drain calls to catch format change
-        val timeout = 0L // Always non-blocking
-        
-        while (iterations++ < maxIterations) {
-            val outputBufferIndex = encoder?.dequeueOutputBuffer(bufferInfo, timeout) ?: MediaCodec.INFO_TRY_AGAIN_LATER
-            
-            when {
-                outputBufferIndex == MediaCodec.INFO_TRY_AGAIN_LATER -> break
-                outputBufferIndex == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    val newFormat = encoder?.outputFormat
-                    Log.d(TAG, "Encoder output format changed: $newFormat")
-                    
-                    // Extract SPS and PPS from format
-                    try {
-                        newFormat?.let { format ->
-                            if (format.containsKey("csd-0")) {
-                                val csd0 = format.getByteBuffer("csd-0")
-                                sps = ByteArray(csd0!!.remaining())
-                                csd0.get(sps!!)
-                                Log.i(TAG, "Extracted SPS: ${sps!!.size} bytes")
-                            }
-                            if (format.containsKey("csd-1")) {
-                                val csd1 = format.getByteBuffer("csd-1")
-                                pps = ByteArray(csd1!!.remaining())
-                                csd1.get(pps!!)
-                                Log.i(TAG, "Extracted PPS: ${pps!!.size} bytes")
-                            }
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error extracting SPS/PPS", e)
-                    }
-                }
-                outputBufferIndex >= 0 -> {
-                    val encodedData = encoder?.getOutputBuffer(outputBufferIndex)
-                    
-                    if (encodedData != null && bufferInfo.size > 0) {
-                        // Extract NAL units and send to active sessions
-                        val nalUnits = extractNALUnits(encodedData, bufferInfo)
-                        val isKeyFrame = (bufferInfo.flags and MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0
-                        val presentationTimeUs = bufferInfo.presentationTimeUs
-                        
-                        sessions.values.forEach { session ->
-                            if (session.state == SessionState.PLAYING) {
-                                nalUnits.forEach { nalUnit ->
-                                    session.sendRTP(nalUnit, isKeyFrame, presentationTimeUs)
-                                }
-                            }
-                        }
-                    }
-                    
-                    encoder?.releaseOutputBuffer(outputBufferIndex, false)
-                    
-                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) {
-                        break
-                    }
-                }
-            }
-        }
-    }
-    
-    /**
-     * Extract NAL units from encoded buffer
-     */
-    private fun extractNALUnits(buffer: ByteBuffer, bufferInfo: MediaCodec.BufferInfo): List<ByteArray> {
-        val nalUnits = mutableListOf<ByteArray>()
-        
-        buffer.position(bufferInfo.offset)
-        buffer.limit(bufferInfo.offset + bufferInfo.size)
-        
-        val data = ByteArray(bufferInfo.size)
-        buffer.get(data)
-        
-        // Find NAL units by start codes (0x00 0x00 0x00 0x01 or 0x00 0x00 0x01)
-        var i = 0
-        while (i < data.size - 3) {
-            if (data[i] == 0.toByte() && data[i+1] == 0.toByte()) {
-                val startCodeLength = when {
-                    data[i+2] == 0.toByte() && data[i+3] == 1.toByte() -> 4
-                    data[i+2] == 1.toByte() -> 3
-                    else -> 0
-                }
-                
-                if (startCodeLength > 0) {
-                    // Find next start code or end of buffer
-                    var nextStart = i + startCodeLength
-                    while (nextStart < data.size - 3) {
-                        if (data[nextStart] == 0.toByte() && data[nextStart+1] == 0.toByte() &&
-                            (data[nextStart+2] == 1.toByte() || 
-                             (data[nextStart+2] == 0.toByte() && nextStart < data.size - 4 && data[nextStart+3] == 1.toByte()))) {
-                            break
-                        }
-                        nextStart++
-                    }
-                    
-                    if (nextStart > i + startCodeLength) {
-                        val nalUnit = data.copyOfRange(i + startCodeLength, 
-                            if (nextStart < data.size - 3) nextStart else data.size)
-                        nalUnits.add(nalUnit)
-                    }
-                    
-                    i = nextStart
-                } else {
-                    i++
-                }
-            } else {
-                i++
-            }
-        }
-        
-        return nalUnits
-    }
-    
-    /**
      * Update codec configuration (SPS/PPS) from pre-encoded H.264 stream
      * Called by H264PreviewEncoder when codec config is available
      */
@@ -1646,7 +888,9 @@ class RTSPServer(
         // Parse NAL units from frame
         val nalUnits = parseNALUnitsFromBuffer(nalUnitData)
         
-        // Update frame count
+        if (frameCount.get() == 0L) {
+            streamStartTimeMs = System.currentTimeMillis()
+        }
         frameCount.incrementAndGet()
         
         // Track FPS
@@ -1755,7 +999,6 @@ class RTSPServer(
             if (!isRunning.get()) return@synchronized
             
             isRunning.set(false)
-            isEncoding.set(false)
             
             releaseAllCameraLeases("server stop")
             
@@ -1794,17 +1037,6 @@ class RTSPServer(
                 // We want to block to ensure proper socket cleanup before returning
                 Thread.sleep(100)
                 
-                // Stop encoder
-                encoder?.let { enc ->
-                    try {
-                        enc.stop()
-                        enc.release()
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Error releasing encoder", e)
-                    }
-                }
-                encoder = null
-                
                 Log.i(TAG, "RTSP server stopped")
                 
             } catch (e: Exception) {
@@ -1820,23 +1052,12 @@ class RTSPServer(
      * Cleanup resources
      */
     private fun cleanup() {
-        yDataBuffer = null
-        uvDataBuffer = null
-        yRowBuffer = null
-        uvRowBuffer = null
         sps = null
         pps = null
     }
     
     /**
      * Check if server is alive (accepting connections).
-     *
-     * NOTE: [encoder] belongs to the legacy [encodeFrame] code-path which is currently
-     * unused – actual H.264 encoding is performed by [H264PreviewEncoder] in CameraService.
-     * Requiring `encoder != null` therefore always returns false and causes
-     * [CameraService.enableRTSPStreaming] to needlessly stop and restart the server on
-     * every call, which in turn triggers EADDRINUSE bind failures.  The server is
-     * considered alive as long as its accept-loop is running.
      */
     fun isAlive(): Boolean = isRunning.get()
 
@@ -1930,72 +1151,47 @@ class RTSPServer(
                 ?: ConnectionLimits.DEFAULT.maxRtspSessions,
             framesEncoded = frameCount.get(),
             droppedFrames = droppedFrameCount.get(),
-            targetFps = fps,
+            targetFps = targetFps,
             encodedFps = encodedFps, // Rate of successful encodes (excludes drops)
             lastError = lastError
         )
     }
-    
+
     /**
-     * Set bitrate at runtime (requires encoder recreation)
+     * Update encoder session metadata for the active surface-input encoder.
      */
-    fun setBitrate(newBitrate: Int): Boolean {
-        if (newBitrate <= 0) {
-            Log.e(TAG, "Invalid bitrate: $newBitrate")
-            return false
-        }
-        
-        Log.i(TAG, "=== BITRATE CHANGE REQUESTED ===")
-        Log.i(TAG, "Current bitrate: $bitrate bps (${bitrate / 1_000_000f} Mbps)")
-        Log.i(TAG, "New bitrate: $newBitrate bps (${newBitrate / 1_000_000f} Mbps)")
-        bitrate = newBitrate
-        Log.i(TAG, "Bitrate updated in memory: $bitrate bps")
-        
-        // Recreate encoder if it's already running
-        if (encoder != null && isEncoding.get()) {
-            Log.i(TAG, "Encoder is running, recreating with new bitrate...")
-            val result = recreateEncoder(width, height)
-            Log.i(TAG, "Encoder recreation ${if (result) "SUCCESSFUL" else "FAILED"}")
-            return result
-        } else {
-            Log.i(TAG, "Encoder not running, bitrate will be applied on next start")
-        }
-        
-        return true
+    fun beginEncoderSession(session: EncoderSession) {
+        encoderName = session.encoderName
+        isHardwareEncoder = session.isHardware
+        encoderColorFormat = session.colorFormat
+        encoderColorFormatName = session.colorFormatName
+        targetFps = session.targetFps
+        bitrate = session.bitrate
+        bitrateModeName = normalizeBitrateMode(session.bitrateMode)
+        frameCount.set(0)
+        droppedFrameCount.set(0)
+        streamStartTimeMs = 0
+        sps = null
+        pps = null
+        lastError = null
     }
-    
-    /**
-     * Set bitrate mode at runtime (VBR/CBR/CQ)
-     */
-    fun setBitrateMode(mode: String): Boolean {
-        val newMode = when (mode.uppercase()) {
-            "VBR" -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
-            "CBR" -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
-            "CQ" -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ
-            else -> {
-                Log.e(TAG, "Invalid bitrate mode: $mode")
-                return false
-            }
+
+    fun updateEncoderConfig(
+        targetFps: Int = this.targetFps,
+        bitrate: Int = this.bitrate,
+        bitrateMode: String = bitrateModeName
+    ) {
+        if (targetFps > 0) {
+            this.targetFps = targetFps
         }
-        
-        Log.i(TAG, "=== BITRATE MODE CHANGE REQUESTED ===")
-        Log.i(TAG, "Current mode: $bitrateModeName (value: $bitrateMode)")
-        Log.i(TAG, "New mode: ${mode.uppercase()} (value: $newMode)")
-        bitrateMode = newMode
-        bitrateModeName = mode.uppercase()
-        Log.i(TAG, "Bitrate mode updated in memory: $bitrateModeName")
-        
-        // Recreate encoder if it's already running
-        if (encoder != null && isEncoding.get()) {
-            Log.i(TAG, "Encoder is running, recreating with new bitrate mode...")
-            val result = recreateEncoder(width, height)
-            Log.i(TAG, "Encoder recreation ${if (result) "SUCCESSFUL" else "FAILED"}")
-            return result
-        } else {
-            Log.i(TAG, "Encoder not running, bitrate mode will be applied on next start")
+        if (bitrate > 0) {
+            this.bitrate = bitrate
         }
-        
-        return true
+        this.bitrateModeName = normalizeBitrateMode(bitrateMode)
+    }
+
+    fun reportEncoderError(message: String) {
+        lastError = message
     }
     
     data class ServerMetrics(

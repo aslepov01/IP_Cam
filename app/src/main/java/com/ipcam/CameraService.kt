@@ -899,6 +899,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                         height = resolution.height,
                         fps = targetRtspFps,
                         bitrate = if (rtspBitrate > 0) rtspBitrate else RTSPServer.calculateBitrate(resolution.width, resolution.height),
+                        bitrateMode = rtspBitrateMode,
                         rtspServer = rtspServer
                     )
                     h264Encoder?.start()
@@ -933,11 +934,8 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                         }
                         .build()
                     
-                    // Configure CameraX Preview with target frame rate for H.264 encoding
-                    // This limits the input frames sent to the encoder at the camera level
                     videoCaptureUseCase = androidx.camera.core.Preview.Builder()
                         .setResolutionSelector(previewResolutionSelector)
-                        .setTargetFrameRate(android.util.Range(targetRtspFps, targetRtspFps))
                         .build()
                         .apply {
                             // Connect to encoder's input surface
@@ -2249,6 +2247,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         // Only update if value actually changed
         if (oldFps != newFps) {
             targetRtspFps = newFps
+            rtspServer?.updateEncoderConfig(targetFps = targetRtspFps)
             saveSettings()
             
             // Only a live RTSP pipeline needs an immediate rebind; otherwise the next RTSP lease
@@ -2269,6 +2268,15 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     }
     
     override fun getTargetRtspFps(): Int = targetRtspFps
+
+    private fun rebindActiveRtspPipeline(reason: String) {
+        if (hasBoundRtspPipeline()) {
+            Log.d(TAG, "$reason, rebinding active RTSP pipeline")
+            requestBindCamera()
+        } else {
+            Log.d(TAG, "$reason, no active RTSP pipeline bound; setting will apply on next RTSP activation")
+        }
+    }
     
     override fun getCurrentFps(): Float = currentCameraFps
     
@@ -2582,13 +2590,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             putBoolean("flashlightOn", isFlashlightOn)
             
             // NOTE: RTSP enabled state is NOT persisted (on-demand only)
-            // Only save RTSP configuration for when it's activated
-            if (rtspServer != null) {
-                rtspServer?.getMetrics()?.let { metrics ->
-                    rtspBitrate = (metrics.bitrateMbps * 1_000_000).toInt()
-                    rtspBitrateMode = metrics.bitrateMode
-                }
-            }
             putInt("rtspBitrate", rtspBitrate)
             putString("rtspBitrateMode", rtspBitrateMode)
             
@@ -3962,8 +3963,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 port = 8554,
                 width = resolution.width,
                 height = resolution.height,
-                fps = targetRtspFps,  // Use saved target FPS instead of hardcoded 30
+                initialFps = targetRtspFps,  // Use saved target FPS instead of hardcoded 30
                 initialBitrate = bitrateToUse,
+                initialBitrateMode = rtspBitrateMode,
                 cameraService = this@CameraService  // Pass reference for FPS tracking
             )
             
@@ -3975,12 +3977,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 rtspEnabled = false
                 saveSettings()
                 return false
-            }
-            
-            // Apply saved bitrate mode if not default
-            if (rtspBitrateMode != "VBR") {
-                Log.d(TAG, "Applying saved RTSP bitrate mode: $rtspBitrateMode")
-                rtspServer?.setBitrateMode(rtspBitrateMode)
             }
             
             rtspEnabled = true
@@ -4078,24 +4074,37 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      * Set RTSP bitrate
      */
     override fun setRTSPBitrate(bitrate: Int): Boolean {
-        if (!rtspEnabled || rtspServer == null) {
-            Log.w(TAG, "Cannot set RTSP bitrate: RTSP not enabled")
+        if (bitrate <= 0) {
+            Log.w(TAG, "Cannot set RTSP bitrate: invalid bitrate=$bitrate")
             return false
         }
-        
-        return rtspServer?.setBitrate(bitrate) ?: false
+
+        rtspBitrate = bitrate
+        rtspServer?.updateEncoderConfig(bitrate = bitrate)
+        saveSettings()
+        rebindActiveRtspPipeline("RTSP bitrate changed to $bitrate")
+        broadcastImmediateTelemetrySnapshot()
+        return true
     }
     
     /**
      * Set RTSP bitrate mode (VBR/CBR/CQ)
      */
     override fun setRTSPBitrateMode(mode: String): Boolean {
-        if (!rtspEnabled || rtspServer == null) {
-            Log.w(TAG, "Cannot set RTSP bitrate mode: RTSP not enabled")
-            return false
+        val normalizedMode = when (mode.uppercase()) {
+            "VBR", "CBR", "CQ" -> mode.uppercase()
+            else -> {
+                Log.w(TAG, "Cannot set RTSP bitrate mode: invalid mode=$mode")
+                return false
+            }
         }
-        
-        return rtspServer?.setBitrateMode(mode) ?: false
+
+        rtspBitrateMode = normalizedMode
+        rtspServer?.updateEncoderConfig(bitrateMode = normalizedMode)
+        saveSettings()
+        rebindActiveRtspPipeline("RTSP bitrate mode changed to $normalizedMode")
+        broadcastImmediateTelemetrySnapshot()
+        return true
     }
     
     // ==================== End RTSP Streaming Control ====================

@@ -1198,7 +1198,7 @@ class HttpServer(
         
         cameraService.setTargetRtspFps(fps)
         call.respondText(
-            """{"status":"ok","message":"RTSP target FPS set to $fps. RTSP server must be restarted for changes to take effect.","targetRtspFps":$fps,"requiresRtspRestart":true}""",
+            """{"status":"ok","message":"RTSP target FPS set to $fps","targetRtspFps":$fps}""",
             ContentType.Application.Json
         )
     }
@@ -1427,7 +1427,7 @@ class HttpServer(
             )
         } else {
             call.respondText(
-                """{"status":"error","message":"Failed to set RTSP bitrate. Ensure RTSP is enabled."}""",
+                """{"status":"error","message":"Failed to set RTSP bitrate."}""",
                 ContentType.Application.Json,
                 HttpStatusCode.InternalServerError
             )
@@ -1458,7 +1458,7 @@ class HttpServer(
             )
         } else {
             call.respondText(
-                """{"status":"error","message":"Failed to set RTSP bitrate mode. Ensure RTSP is enabled."}""",
+                """{"status":"error","message":"Failed to set RTSP bitrate mode."}""",
                 ContentType.Application.Json,
                 HttpStatusCode.InternalServerError
             )

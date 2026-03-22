@@ -22,6 +22,7 @@ class H264PreviewEncoder(
     private val height: Int,
     private val fps: Int = 30,
     private val bitrate: Int = 5_000_000, // 5 Mbps
+    private val bitrateMode: String = "VBR",
     private val rtspServer: RTSPServer?
 ) {
     
@@ -95,28 +96,21 @@ class H264PreviewEncoder(
             // Start encoder
             encoder?.start()
             isRunning = true
+
+            reportEncoderSessionStarted()
             
             // Verify encoder configuration by reading output format
             try {
                 val outputFormat = encoder?.outputFormat
                 if (outputFormat != null) {
-                    val actualFrameRate = outputFormat.getInteger(MediaFormat.KEY_FRAME_RATE)
-                    val actualBitrate = outputFormat.getInteger(MediaFormat.KEY_BIT_RATE)
-                    val actualBitrateMode = if (outputFormat.containsKey(MediaFormat.KEY_BITRATE_MODE)) {
-                        when (outputFormat.getInteger(MediaFormat.KEY_BITRATE_MODE)) {
-                            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR -> "VBR"
-                            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR -> "CBR"
-                            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ -> "CQ"
-                            else -> "Unknown"
-                        }
-                    } else {
-                        "Not specified"
-                    }
+                    val actualFrameRate = outputFormat.getNumber(MediaFormat.KEY_FRAME_RATE)?.toFloat()
+                    val actualBitrate = outputFormat.getNumber(MediaFormat.KEY_BIT_RATE)?.toInt()
+                    val actualBitrateMode = readBitrateModeName(outputFormat)
                     
                     Log.i(TAG, "=== ENCODER OUTPUT FORMAT VERIFICATION ===")
-                    Log.i(TAG, "Configured FPS: $fps, Actual output FPS: $actualFrameRate")
-                    Log.i(TAG, "Configured bitrate: ${bitrate / 1_000_000}Mbps, Actual output bitrate: ${actualBitrate / 1_000_000}Mbps")
-                    Log.i(TAG, "Configured bitrate mode: VBR, Actual output mode: $actualBitrateMode")
+                    Log.i(TAG, "Configured FPS cap: $fps, Reported output FPS: ${actualFrameRate ?: "n/a"}")
+                    Log.i(TAG, "Configured bitrate: ${bitrate / 1_000_000}Mbps, Reported output bitrate: ${actualBitrate?.div(1_000_000f) ?: "n/a"}Mbps")
+                    Log.i(TAG, "Configured bitrate mode: ${bitrateMode.uppercase()}, Reported output mode: $actualBitrateMode")
                     Log.i(TAG, "Full output format: $outputFormat")
                     Log.i(TAG, "==========================================")
                 }
@@ -145,10 +139,11 @@ class H264PreviewEncoder(
                 }
             }
             
-            Log.i(TAG, "H.264 encoder started: ${width}x${height} @ ${fps}fps, ${bitrate/1_000_000}Mbps")
+            Log.i(TAG, "H.264 encoder started: ${width}x${height} @ ${fps}fps cap, ${bitrate/1_000_000}Mbps, mode=${bitrateMode.uppercase()}")
             
         } catch (e: Exception) {
             Log.e(TAG, "Failed to start H.264 encoder", e)
+            rtspServer?.reportEncoderError("H.264 encoder start failed: ${e.message}")
             stop()
         }
     }
@@ -173,13 +168,9 @@ class H264PreviewEncoder(
                 setInteger(MediaFormat.KEY_BIT_RATE, bitrate)
                 setInteger(MediaFormat.KEY_FRAME_RATE, fps)
                 setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, I_FRAME_INTERVAL)
-                
-                // CRITICAL: Set operating rate to actually limit output framerate
-                // KEY_FRAME_RATE is just a hint for rate control, doesn't limit output
-                // KEY_OPERATING_RATE actually controls the encoding rate
-                setInteger(MediaFormat.KEY_OPERATING_RATE, fps)
-                
-                Log.d(TAG, "Encoder framerate configured: KEY_FRAME_RATE=$fps, KEY_OPERATING_RATE=$fps")
+                setFloat(MediaFormat.KEY_MAX_FPS_TO_ENCODER, fps.toFloat())
+
+                Log.d(TAG, "Encoder framerate configured: KEY_FRAME_RATE=$fps, KEY_MAX_FPS_TO_ENCODER=$fps")
                 
                 // Low-latency encoding settings for RTSP streaming
                 // These settings minimize encoder buffering and reduce latency
@@ -201,10 +192,7 @@ class H264PreviewEncoder(
                 
                 // Optional: Enable hardware encoding with VBR
                 if (includeBitrateMode) {
-                    setInteger(
-                        MediaFormat.KEY_BITRATE_MODE,
-                        MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
-                    )
+                    setInteger(MediaFormat.KEY_BITRATE_MODE, resolveBitrateMode(bitrateMode))
                 }
                 
                 // Optional: Set baseline profile for maximum compatibility
@@ -224,6 +212,25 @@ class H264PreviewEncoder(
         } catch (e: Exception) {
             Log.w(TAG, "Configuration attempt #$attempt failed: ${e.message}")
             false
+        }
+    }
+
+    private fun resolveBitrateMode(mode: String): Int {
+        return when (mode.uppercase()) {
+            "VBR" -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+            "CBR" -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR
+            "CQ" -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ
+            else -> MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+        }
+    }
+
+    private fun readBitrateModeName(format: MediaFormat): String {
+        val rawMode = format.getNumber(MediaFormat.KEY_BITRATE_MODE)?.toInt() ?: return "Not specified"
+        return when (rawMode) {
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR -> "VBR"
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR -> "CBR"
+            MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CQ -> "CQ"
+            else -> "Unknown"
         }
     }
     
@@ -257,6 +264,34 @@ class H264PreviewEncoder(
             }
         } catch (e: Exception) {
             Log.w(TAG, "Could not log encoder capabilities: ${e.message}")
+        }
+    }
+
+    private fun reportEncoderSessionStarted() {
+        val codecInfo = encoder?.codecInfo ?: return
+        rtspServer?.beginEncoderSession(
+            RTSPServer.EncoderSession(
+                encoderName = codecInfo.name,
+                isHardware = codecInfo.isHardwareAccelerated,
+                colorFormat = MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface,
+                colorFormatName = getColorFormatName(MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface),
+                targetFps = fps,
+                bitrate = bitrate,
+                bitrateMode = bitrateMode.uppercase()
+            )
+        )
+    }
+
+    private fun getColorFormatName(format: Int): String {
+        return when (format) {
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface -> "COLOR_FormatSurface"
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Flexible -> "COLOR_FormatYUV420Flexible"
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420Planar -> "COLOR_FormatYUV420Planar (I420)"
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420SemiPlanar -> "COLOR_FormatYUV420SemiPlanar (NV12)"
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420PackedPlanar -> "COLOR_FormatYUV420PackedPlanar"
+            MediaCodecInfo.CodecCapabilities.COLOR_FormatYUV420PackedSemiPlanar -> "COLOR_FormatYUV420PackedSemiPlanar (NV21)"
+            0x7F420888 -> "COLOR_FormatYUV420Flexible (Android)"
+            else -> "Unknown (0x${Integer.toHexString(format)})"
         }
     }
     
