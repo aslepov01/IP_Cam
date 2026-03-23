@@ -1,6 +1,107 @@
 // Configuration constants
                     const STREAM_RELOAD_DELAY_MS = 200;
                     const CONNECTIONS_REFRESH_DEBOUNCE_MS = 500;
+                    const THEME_STORAGE_KEY = 'ipcam-theme-mode';
+                    const THEME_MODE_AUTO = 'auto';
+                    const THEME_MODE_LIGHT = 'light';
+                    const THEME_MODE_DARK = 'dark';
+                    const themeMediaQuery = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+                    let currentThemeMode = normalizeThemeMode(document.documentElement.dataset.themeMode);
+
+                    function normalizeThemeMode(themeMode) {
+                        if (themeMode === THEME_MODE_LIGHT || themeMode === THEME_MODE_DARK || themeMode === THEME_MODE_AUTO) {
+                            return themeMode;
+                        }
+
+                        return THEME_MODE_AUTO;
+                    }
+
+                    function readStoredThemeMode() {
+                        try {
+                            return normalizeThemeMode(localStorage.getItem(THEME_STORAGE_KEY));
+                        } catch (error) {
+                            return THEME_MODE_AUTO;
+                        }
+                    }
+
+                    function saveThemeMode(themeMode) {
+                        try {
+                            localStorage.setItem(THEME_STORAGE_KEY, normalizeThemeMode(themeMode));
+                        } catch (error) {
+                            // Ignore storage access failures; theme still applies for this session.
+                        }
+                    }
+
+                    function getSystemTheme() {
+                        return themeMediaQuery && themeMediaQuery.matches ? THEME_MODE_DARK : THEME_MODE_LIGHT;
+                    }
+
+                    function getEffectiveTheme(themeMode) {
+                        const normalizedThemeMode = normalizeThemeMode(themeMode);
+                        return normalizedThemeMode === THEME_MODE_AUTO ? getSystemTheme() : normalizedThemeMode;
+                    }
+
+                    function formatThemeLabel(themeName) {
+                        return themeName.charAt(0).toUpperCase() + themeName.slice(1);
+                    }
+
+                    function updateThemeControls() {
+                        const themeModeSelect = document.getElementById('themeModeSelect');
+                        if (themeModeSelect && themeModeSelect.value !== currentThemeMode) {
+                            themeModeSelect.value = currentThemeMode;
+                        }
+
+                        const themeStatus = document.getElementById('themeStatus');
+                        if (!themeStatus) {
+                            return;
+                        }
+
+                        const effectiveTheme = getEffectiveTheme(currentThemeMode);
+                        if (currentThemeMode === THEME_MODE_AUTO) {
+                            themeStatus.className = 'alert info theme-status';
+                            themeStatus.textContent = 'Theme: Auto. Currently using ' + formatThemeLabel(effectiveTheme) + ' based on your system preference.';
+                        } else {
+                            themeStatus.className = 'alert info theme-status';
+                            themeStatus.textContent = 'Theme is locked to ' + formatThemeLabel(effectiveTheme) + '. Switch back to Auto to follow the system theme.';
+                        }
+                    }
+
+                    function applyThemeMode(themeMode) {
+                        currentThemeMode = normalizeThemeMode(themeMode);
+                        document.documentElement.dataset.themeMode = currentThemeMode;
+                        document.documentElement.dataset.theme = getEffectiveTheme(currentThemeMode);
+                        updateThemeControls();
+                    }
+
+                    function initializeThemeControls() {
+                        const themeModeSelect = document.getElementById('themeModeSelect');
+                        if (themeModeSelect && !themeModeSelect.dataset.initialized) {
+                            themeModeSelect.addEventListener('change', function(event) {
+                                const nextThemeMode = normalizeThemeMode(event.target.value);
+                                saveThemeMode(nextThemeMode);
+                                applyThemeMode(nextThemeMode);
+                            });
+                            themeModeSelect.dataset.initialized = 'true';
+                        }
+
+                        updateThemeControls();
+                    }
+
+                    function handleSystemThemeChange() {
+                        if (currentThemeMode === THEME_MODE_AUTO) {
+                            applyThemeMode(THEME_MODE_AUTO);
+                        }
+                    }
+
+                    if (themeMediaQuery) {
+                        if (themeMediaQuery.addEventListener) {
+                            themeMediaQuery.addEventListener('change', handleSystemThemeChange);
+                        } else if (themeMediaQuery.addListener) {
+                            themeMediaQuery.addListener(handleSystemThemeChange);
+                        }
+                    }
+
+                    applyThemeMode(readStoredThemeMode());
                     
                     // Tab switching functionality
                     function switchTab(tabName) {
@@ -416,7 +517,7 @@
                         const container = document.getElementById('connectionsContainer');
                         
                         if (!connections || connections.length === 0) {
-                            container.innerHTML = '<p style="color: #666;">No active connections</p>';
+                            container.innerHTML = '<p class="section-description">No active connections</p>';
                             return;
                         }
                         
@@ -430,7 +531,7 @@
                             html += '<td>' + conn.remoteAddr + '</td>';
                             html += '<td>' + conn.endpoint + '</td>';
                             html += '<td>' + Math.floor(conn.duration / 1000) + '</td>';
-                            html += '<td><button onclick="closeConnection(' + JSON.stringify(conn.id) + ')" class="danger" style="padding: 6px 12px; font-size: 12px;">Close</button></td>';
+                            html += '<td><button onclick="closeConnection(' + JSON.stringify(conn.id) + ')" class="danger small-button">Close</button></td>';
                             html += '</tr>';
                         });
                         
@@ -764,9 +865,9 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
 
                         if (lastReceivedState.rtspEnabled) {
                             const rtspFps = Number(lastReceivedMetrics.currentRtspFps || 0).toFixed(1);
-                            rtspStatusDisplay.innerHTML = '<span style="color: #4CAF50;">Enabled</span><br><span style="font-size: 20px;">' + rtspFps + ' fps</span>';
+                            rtspStatusDisplay.innerHTML = '<span class="status-badge success">Enabled</span><span class="metric-detail">' + rtspFps + ' fps</span>';
                         } else {
-                            rtspStatusDisplay.innerHTML = '<span style="color: #999;">Disabled</span>';
+                            rtspStatusDisplay.innerHTML = '<span class="status-badge neutral">Disabled</span>';
                         }
                     }
 
@@ -1181,6 +1282,22 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                             });
                     }                    
                     // ==================== Software Update Functions ====================
+
+                    function setStatusPanelState(element, state) {
+                        if (!element) {
+                            return;
+                        }
+
+                        element.className = 'status-panel ' + state;
+                    }
+
+                    function buildStatusMessage(state, title, bodyHtml) {
+                        let html = '<strong class="status-title ' + state + '">' + title + '</strong>';
+                        if (bodyHtml) {
+                            html += '<div class="status-details">' + bodyHtml + '</div>';
+                        }
+                        return html;
+                    }
                     
                     /**
                      * Check for available software updates from GitHub Releases
@@ -1194,8 +1311,8 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                         // Disable button and show loading state
                         checkBtn.disabled = true;
                         checkBtn.textContent = 'Checking...';
-                        statusEl.textContent = 'Checking for updates...';
-                        statusContainer.style.background = '#f5f5f5';
+                        statusEl.innerHTML = '<span class="status-copy">Checking for updates...</span>';
+                        setStatusPanelState(statusContainer, 'default');
                         installBtn.style.display = 'none';
                         
                         try {
@@ -1206,39 +1323,47 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                                 if (result.updateAvailable) {
                                     // Update available
                                     const sizeMB = (result.apkSize / 1024 / 1024).toFixed(2);
-                                    statusContainer.style.background = '#e8f5e9';
-                                    statusEl.innerHTML = 
-                                        '<strong style="color: #2e7d32;">✓ Update Available!</strong><br>' +
-                                        '<div style="margin-top: 8px; line-height: 1.6;">' +
-                                        '<strong>Latest Version:</strong> ' + result.latestVersionName + '<br>' +
-                                        '<strong>Current Version:</strong> Build ' + result.currentVersion + '<br>' +
-                                        '<strong>Download Size:</strong> ' + sizeMB + ' MB<br>' +
-                                        '<strong>Release Notes:</strong><br>' +
-                                        '<div style="padding: 8px; background: white; border-radius: 4px; margin-top: 4px; max-height: 150px; overflow-y: auto; white-space: pre-wrap; font-size: 13px;">' +
-                                        escapeHtml(result.releaseNotes) +
-                                        '</div>' +
-                                        '</div>';
+                                    setStatusPanelState(statusContainer, 'success');
+                                    statusEl.innerHTML =
+                                        buildStatusMessage(
+                                            'success',
+                                            'Update Available',
+                                            '<strong>Latest Version:</strong> ' + escapeHtml(String(result.latestVersionName || 'Unknown')) + '<br>' +
+                                            '<strong>Current Version:</strong> Build ' + escapeHtml(String(result.currentVersion || 'Unknown')) + '<br>' +
+                                            '<strong>Download Size:</strong> ' + sizeMB + ' MB<br>' +
+                                            '<strong>Release Notes:</strong>' +
+                                            '<div class="release-notes">' + escapeHtml(result.releaseNotes || 'No release notes provided.') + '</div>'
+                                        );
                                     installBtn.style.display = 'inline-block';
                                 } else {
                                     // No update available
-                                    statusContainer.style.background = '#e3f2fd';
-                                    statusEl.innerHTML = 
-                                        '<strong style="color: #1976d2;">✓ You are running the latest version</strong><br>' +
-                                        '<div style="margin-top: 4px; color: #666;">Current version: Build ' + result.currentVersion + '</div>';
+                                    setStatusPanelState(statusContainer, 'info');
+                                    statusEl.innerHTML =
+                                        buildStatusMessage(
+                                            'info',
+                                            'You are running the latest version',
+                                            '<div class="status-meta">Current version: Build ' + escapeHtml(String(result.currentVersion || 'Unknown')) + '</div>'
+                                        );
                                 }
                             } else {
                                 // Error from server
-                                statusContainer.style.background = '#ffebee';
-                                statusEl.innerHTML = 
-                                    '<strong style="color: #c62828;">✗ Error</strong><br>' +
-                                    '<div style="margin-top: 4px;">' + escapeHtml(result.message) + '</div>';
+                                setStatusPanelState(statusContainer, 'danger');
+                                statusEl.innerHTML =
+                                    buildStatusMessage(
+                                        'danger',
+                                        'Error',
+                                        '<div class="status-meta">' + escapeHtml(String(result.message || 'Unknown error')) + '</div>'
+                                    );
                             }
                         } catch (error) {
                             // Network or other error
-                            statusContainer.style.background = '#ffebee';
-                            statusEl.innerHTML = 
-                                '<strong style="color: #c62828;">✗ Error</strong><br>' +
-                                '<div style="margin-top: 4px;">' + escapeHtml(String(error)) + '</div>';
+                            setStatusPanelState(statusContainer, 'danger');
+                            statusEl.innerHTML =
+                                buildStatusMessage(
+                                    'danger',
+                                    'Error',
+                                    '<div class="status-meta">' + escapeHtml(String(error)) + '</div>'
+                                );
                         } finally {
                             // Re-enable button
                             checkBtn.disabled = false;
@@ -1262,34 +1387,46 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                         // Disable button and show downloading state
                         installBtn.disabled = true;
                         installBtn.textContent = 'Downloading...';
-                        statusContainer.style.background = '#fff3e0';
-                        statusEl.innerHTML = 
-                            '<strong style="color: #f57c00;">⏳ Downloading update...</strong><br>' +
-                            '<div style="margin-top: 4px;">This may take a minute depending on your connection speed.</div>';
+                        setStatusPanelState(statusContainer, 'warning');
+                        statusEl.innerHTML =
+                            buildStatusMessage(
+                                'warning',
+                                'Downloading update...',
+                                '<div class="status-meta">This may take a minute depending on your connection speed.</div>'
+                            );
                         
                         try {
                             const response = await fetch('/triggerUpdate');
                             const result = await response.json();
                             
                             if (result.status === 'ok') {
-                                statusContainer.style.background = '#e8f5e9';
-                                statusEl.innerHTML = 
-                                    '<strong style="color: #2e7d32;">✓ Download Complete</strong><br>' +
-                                    '<div style="margin-top: 4px;">Please confirm installation on your device. The update will be installed and the app will restart.</div>';
+                                setStatusPanelState(statusContainer, 'success');
+                                statusEl.innerHTML =
+                                    buildStatusMessage(
+                                        'success',
+                                        'Download Complete',
+                                        '<div class="status-meta">Please confirm installation on your device. The update will be installed and the app will restart.</div>'
+                                    );
                                 installBtn.style.display = 'none';
                             } else {
-                                statusContainer.style.background = '#ffebee';
-                                statusEl.innerHTML = 
-                                    '<strong style="color: #c62828;">✗ Error</strong><br>' +
-                                    '<div style="margin-top: 4px;">' + escapeHtml(result.message) + '</div>';
+                                setStatusPanelState(statusContainer, 'danger');
+                                statusEl.innerHTML =
+                                    buildStatusMessage(
+                                        'danger',
+                                        'Error',
+                                        '<div class="status-meta">' + escapeHtml(String(result.message || 'Unknown error')) + '</div>'
+                                    );
                                 installBtn.disabled = false;
                                 installBtn.textContent = 'Install Update';
                             }
                         } catch (error) {
-                            statusContainer.style.background = '#ffebee';
-                            statusEl.innerHTML = 
-                                '<strong style="color: #c62828;">✗ Error</strong><br>' +
-                                '<div style="margin-top: 4px;">' + escapeHtml(String(error)) + '</div>';
+                            setStatusPanelState(statusContainer, 'danger');
+                            statusEl.innerHTML =
+                                buildStatusMessage(
+                                    'danger',
+                                    'Error',
+                                    '<div class="status-meta">' + escapeHtml(String(error)) + '</div>'
+                                );
                             installBtn.disabled = false;
                             installBtn.textContent = 'Install Update';
                         }
@@ -1310,6 +1447,7 @@ ${diag.isDeviceOwner ? 'Multiple reboot methods will be tried if primary method 
                     
                     // Show ADB connection info if available on page load
                     document.addEventListener('DOMContentLoaded', function() {
+                        initializeThemeControls();
                         const adbInfoElement = document.getElementById('adbConnectionInfo');
                         if (adbInfoElement) {
                             const adbText = adbInfoElement.textContent.trim();
