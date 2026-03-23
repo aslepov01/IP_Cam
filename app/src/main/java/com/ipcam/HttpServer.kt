@@ -17,6 +17,7 @@ import io.ktor.utils.io.*
 import kotlinx.coroutines.*
 import java.util.Locale
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
@@ -55,6 +56,7 @@ class HttpServer(
         /** Path of the log endpoint used in error responses and links. */
         private const val LOGS_PATH = "/logs"
         private const val MAX_MJPEG_STREAMS_PER_IP = 1
+        private const val STREAM_NO_FRAME_TIMEOUT_MS = 5_000L
     }
     
     /**
@@ -80,8 +82,11 @@ class HttpServer(
         val remoteAddr: String,
         val startTime: Long = System.currentTimeMillis(),
         @Volatile var cancelled: Boolean = false,
+        @Volatile var requestJob: Job? = null,
         @Volatile var channel: ByteWriteChannel? = null,
-        @Volatile var responseJob: Job? = null
+        @Volatile var responseJob: Job? = null,
+        val streamLeaseAcquired: AtomicBoolean = AtomicBoolean(false),
+        val released: AtomicBoolean = AtomicBoolean(false)
     )
 
     /** All active MJPEG stream clients, keyed by unique client ID. */
@@ -110,6 +115,10 @@ class HttpServer(
             }
             
             install(StatusPages) {
+                exception<java.util.concurrent.CancellationException> { call, cause ->
+                    Log.d(TAG, "Request cancelled: ${call.request.local.uri}")
+                    throw cause
+                }
                 exception<Throwable> { call, cause ->
                     Log.e(TAG, "Request failed: ${call.request.local.uri}", cause)
                     call.respondText(
@@ -219,13 +228,10 @@ class HttpServer(
         server = null
         
         // Clean up stream clients
-        streamClients.values.forEach { terminateStreamClient(it, "server stop") }
-        streamClients.clear()
-        activeStreams.set(0)
+        val streamClientsToRelease = streamClients.values.toList()
+        streamClientsToRelease.forEach { terminateStreamClient(it, "server stop") }
+        streamClientsToRelease.forEach { releaseStreamClient(it, "server stop") }
         activeSnapshots.set(0)
-        synchronized(streamClientsByIpLock) {
-            streamClientByIp.clear()
-        }
         
         // Clean up SSE clients
         synchronized(sseClientsLock) {
@@ -259,15 +265,23 @@ class HttpServer(
         val snapshots = mutableListOf<ConnectionSnapshot>()
 
         streamClients.values.forEach { client ->
-            if (!client.cancelled) {
+            val isReleased = client.released.get()
+            if (!isReleased) {
+                val isActive = !client.cancelled
+                val state = when {
+                    client.cancelled -> "CLOSING"
+                    client.streamLeaseAcquired.get() -> "STREAMING"
+                    else -> "OPENING"
+                }
                 snapshots.add(
                     ConnectionSnapshot(
                         id = "mjpeg:${client.id}",
                         kind = ConnectionKind.MJPEG,
-                        state = "STREAMING",
+                        state = state,
                         remoteAddr = client.remoteAddr,
                         endpoint = "/stream",
-                        startTimeMs = client.startTime
+                        startTimeMs = client.startTime,
+                        active = isActive
                     )
                 )
             }
@@ -312,14 +326,84 @@ class HttpServer(
     }
 
     private fun terminateStreamClient(client: StreamClient, reason: String): Boolean {
-        if (client.cancelled) {
+        if (client.cancelled || client.released.get()) {
             return false
         }
 
         client.cancelled = true
+        Log.d(TAG, "Terminating MJPEG stream client ${client.id} (${client.remoteAddr}) - $reason")
+        runCatching { client.requestJob?.cancel() }
         runCatching { client.responseJob?.cancel() }
-        runCatching { client.channel?.close() }
+        runCatching {
+            client.channel?.close(io.ktor.utils.io.CancellationException("MJPEG stream terminated: $reason"))
+        }
+        if (!client.streamLeaseAcquired.get()) {
+            releaseStreamClient(client, "$reason before stream writer start")
+        }
         return true
+    }
+
+    private fun releaseStreamClient(client: StreamClient, reason: String): Int? {
+        if (!client.released.compareAndSet(false, true)) {
+            return null
+        }
+
+        client.cancelled = true
+        streamClients.remove(client.id, client)
+        synchronized(streamClientsByIpLock) {
+            if (streamClientByIp[client.remoteAddr] == client.id) {
+                streamClientByIp.remove(client.remoteAddr)
+            }
+        }
+
+        val releasedStreamingLease = client.streamLeaseAcquired.getAndSet(false)
+        val remainingStreams = if (releasedStreamingLease) {
+            val activeStreamsRemaining = decrementActiveStreams()
+            Log.d(
+                TAG,
+                "Released MJPEG stream client ${client.id} (${client.remoteAddr}) - $reason. " +
+                    "Active streams: $activeStreamsRemaining"
+            )
+            if (activeStreamsRemaining == 0) {
+                Log.d(TAG, "Last MJPEG stream disconnected, unregistering consumer...")
+                cameraService.unregisterMjpegConsumer()
+            }
+            activeStreamsRemaining
+        } else {
+            Log.d(
+                TAG,
+                "Released opening MJPEG stream client ${client.id} (${client.remoteAddr}) - $reason. " +
+                    "Active streams: ${activeStreams.get()}"
+            )
+            activeStreams.get()
+        }
+        cameraService.onLongLivedConnectionsChanged()
+
+        return remainingStreams
+    }
+
+    private fun acquireStreamLease(client: StreamClient): Int {
+        if (!client.streamLeaseAcquired.compareAndSet(false, true)) {
+            return activeStreams.get()
+        }
+
+        val streamCount = activeStreams.incrementAndGet()
+        if (streamCount == 1) {
+            Log.d(TAG, "First MJPEG stream connecting, registering consumer...")
+            cameraService.registerMjpegConsumer()
+        }
+
+        return streamCount
+    }
+
+    private fun decrementActiveStreams(): Int {
+        while (true) {
+            val current = activeStreams.get()
+            val next = if (current > 0) current - 1 else 0
+            if (activeStreams.compareAndSet(current, next)) {
+                return next
+            }
+        }
     }
 
     private fun terminateSseClient(client: SSEClient, reason: String): Boolean {
@@ -604,139 +688,140 @@ class HttpServer(
         val clientId = clientIdCounter.incrementAndGet()
         val clientIp = rawIp.ifBlank { "unknown-$clientId" }
 
-        // Atomically reserve a slot before touching any other state.
-        // Incrementing first avoids the TOCTOU race of a separate get() + incrementAndGet() pair.
         val maxMjpegStreams = cameraService.getConnectionLimits().maxMjpegStreams
-        val streamCount = activeStreams.incrementAndGet()
-        if (streamCount > maxMjpegStreams) {
-            // Rather than rejecting the new client with 503, evict the globally oldest active
-            // stream so that reconnecting clients (or NVR systems that reopen streams) are never
-            // stuck waiting for a slot.  The evicted stream's finally-block will decrement
-            // activeStreams, bringing the count back to maxMjpegStreams.
-            val globallyOldest = streamClients.values
-                .filter { !it.cancelled }
-                .minByOrNull { it.startTime }
-            if (globallyOldest != null) {
-                Log.w(
-                    TAG,
-                    "MJPEG limit ($maxMjpegStreams) reached, evicting oldest stream " +
-                    "id=${globallyOldest.id} (IP: ${globallyOldest.remoteAddr}) " +
-                    "to accept new client from $clientIp"
-                )
-                terminateStreamClient(globallyOldest, "global MJPEG limit reached")
-            } else {
-                // All existing streams are already in the process of being cancelled; the count
-                // will normalise as their finally-blocks run.  Log and continue.
+        val newClient = StreamClient(clientId, clientIp)
+        try {
+            newClient.requestJob = currentCoroutineContext()[Job]
+            streamClients[clientId] = newClient
+            newClient.requestJob?.invokeOnCompletion {
+                releaseStreamClient(newClient, "request coroutine completed")
+            }
+
+            val activeOrOpeningStreams = streamClients.values.count { !it.cancelled && !it.released.get() }
+            if (activeOrOpeningStreams > maxMjpegStreams) {
+                // Evict the oldest non-cancelled stream/opening request so reconnect storms don't
+                // accumulate pending stream handlers that never acquired a writer.
+                val globallyOldest = streamClients.values
+                    .filter { it.id != clientId && !it.cancelled && !it.released.get() }
+                    .minByOrNull { it.startTime }
+                if (globallyOldest != null) {
+                    Log.w(
+                        TAG,
+                        "MJPEG limit ($maxMjpegStreams) reached, evicting oldest stream " +
+                            "id=${globallyOldest.id} (IP: ${globallyOldest.remoteAddr}) " +
+                            "to accept new client from $clientIp"
+                    )
+                    terminateStreamClient(globallyOldest, "global MJPEG limit reached")
+                } else {
+                    Log.d(
+                        TAG,
+                        "MJPEG limit ($maxMjpegStreams) temporarily exceeded while opening client $clientId; " +
+                            "all older streams are already being cancelled"
+                    )
+                }
+            }
+
+            // Allow only one MJPEG stream per IP. A newer connection replaces the older one so
+            // reconnecting browsers and NVRs do not accumulate stale streams on the same host.
+            var previousClientFromSameIp: StreamClient? = null
+            synchronized(streamClientsByIpLock) {
+                val previousClientId = streamClientByIp.put(clientIp, clientId)
+                if (previousClientId != null && previousClientId != clientId) {
+                    previousClientFromSameIp = streamClients[previousClientId]
+                }
+            }
+            previousClientFromSameIp?.let { previous ->
                 Log.d(
                     TAG,
-                    "MJPEG limit ($maxMjpegStreams) temporarily exceeded (count: $streamCount); " +
-                    "all excess streams are already being cancelled"
+                    "MJPEG per-IP limit ($MAX_MJPEG_STREAMS_PER_IP) reached for $clientIp, " +
+                        "evicting previous stream id=${previous.id}"
                 )
+                terminateStreamClient(previous, "MJPEG per-IP replacement")
             }
-        }
 
-        // Allow only one MJPEG stream per IP. A newer connection replaces the older one so
-        // reconnecting browsers and NVRs do not accumulate stale streams on the same host.
-        val newClient = StreamClient(clientId, clientIp)
-        streamClients[clientId] = newClient
-        var previousClientFromSameIp: StreamClient? = null
-        synchronized(streamClientsByIpLock) {
-            val previousClientId = streamClientByIp.put(clientIp, clientId)
-            if (previousClientId != null && previousClientId != clientId) {
-                previousClientFromSameIp = streamClients[previousClientId]
-            }
-        }
-        previousClientFromSameIp?.let { previous ->
-            Log.d(
-                TAG,
-                "MJPEG per-IP limit ($MAX_MJPEG_STREAMS_PER_IP) reached for $clientIp, " +
-                    "evicting previous stream id=${previous.id}"
-            )
-            terminateStreamClient(previous, "MJPEG per-IP replacement")
-        }
+            Log.d(TAG, "Stream request opened. Client $clientId (IP: $clientIp)")
+            cameraService.onLongLivedConnectionsChanged()
 
-        val isFirstStream = streamCount == 1
-        
-        // Register MJPEG consumer when first stream connects
-        if (isFirstStream) {
-            Log.d(TAG, "First MJPEG stream connecting, registering consumer...")
-            cameraService.registerMjpegConsumer()
-        }
-        
-        Log.d(TAG, "Stream connection opened. Client $clientId (IP: $clientIp). Active streams: $streamCount")
-        cameraService.onLongLivedConnectionsChanged()
-        
-        call.response.header(HttpHeaders.Connection, "close")
-        call.respondBytesWriter(ContentType.parse("multipart/x-mixed-replace; boundary=--jpgboundary")) {
-            newClient.channel = this
-            newClient.responseJob = currentCoroutineContext()[Job]
-            try {
-                while (isActive && !newClient.cancelled) {
-                    // Check if streaming is still allowed (battery might have dropped during stream)
-                    if (!cameraService.isStreamingAllowed()) {
-                        Log.d(TAG, "Stream client $clientId - streaming no longer allowed (critical battery)")
-                        break
+            call.response.header(HttpHeaders.Connection, "close")
+            call.respondBytesWriter(ContentType.parse("multipart/x-mixed-replace; boundary=--jpgboundary")) {
+                newClient.channel = this
+                newClient.responseJob = currentCoroutineContext()[Job]
+                var lastFrameServedAtMs = System.currentTimeMillis()
+                var leaseAcquired = false
+
+                try {
+                    if (newClient.cancelled || newClient.released.get()) {
+                        return@respondBytesWriter
                     }
-                    
-                    val jpegBytes = cameraService.getLastFrameJpegBytes()
-                    
-                    if (jpegBytes != null) {
-                        try {
-                            val boundary = "--jpgboundary\r\n"
-                            val contentTypeHeader = "Content-Type: image/jpeg\r\n"
-                            val contentLengthHeader = "Content-Length: ${jpegBytes.size}\r\n\r\n"
-                            val trailingCrLf = "\r\n"
 
-                            writeStringUtf8(boundary)
-                            writeStringUtf8(contentTypeHeader)
-                            writeStringUtf8(contentLengthHeader)
-                            writeFully(jpegBytes, 0, jpegBytes.size)
-                            writeStringUtf8(trailingCrLf)
-                            flush()
+                    val streamCount = acquireStreamLease(newClient)
+                    leaseAcquired = true
+                    Log.d(
+                        TAG,
+                        "Stream writer started. Client $clientId (IP: $clientIp). Active streams: $streamCount"
+                    )
+                    cameraService.onLongLivedConnectionsChanged()
 
-                            val actualFrameBytes =
-                                boundary.length +
-                                contentTypeHeader.length +
-                                contentLengthHeader.length +
-                                jpegBytes.size +
-                                trailingCrLf.length
-                            cameraService.recordStreamingBytes(StreamTransport.MJPEG, actualFrameBytes.toLong())
-                            
-                            // Track MJPEG streaming FPS
-                            cameraService.recordMjpegFrameServed()
-                        } catch (e: Exception) {
-                            Log.d(TAG, "Stream client $clientId disconnected")
+                    while (isActive && !newClient.cancelled) {
+                        // Check if streaming is still allowed (battery might have dropped during stream)
+                        if (!cameraService.isStreamingAllowed()) {
+                            Log.d(TAG, "Stream client $clientId - streaming no longer allowed (critical battery)")
                             break
                         }
+
+                        val jpegBytes = cameraService.getLastFrameJpegBytes()
+
+                        if (jpegBytes != null) {
+                            try {
+                                val boundary = "--jpgboundary\r\n"
+                                val contentTypeHeader = "Content-Type: image/jpeg\r\n"
+                                val contentLengthHeader = "Content-Length: ${jpegBytes.size}\r\n\r\n"
+                                val trailingCrLf = "\r\n"
+
+                                writeStringUtf8(boundary)
+                                writeStringUtf8(contentTypeHeader)
+                                writeStringUtf8(contentLengthHeader)
+                                writeFully(jpegBytes, 0, jpegBytes.size)
+                                writeStringUtf8(trailingCrLf)
+                                flush()
+
+                                val actualFrameBytes =
+                                    boundary.length +
+                                    contentTypeHeader.length +
+                                    contentLengthHeader.length +
+                                    jpegBytes.size +
+                                    trailingCrLf.length
+                                cameraService.recordStreamingBytes(StreamTransport.MJPEG, actualFrameBytes.toLong())
+
+                                // Track MJPEG streaming FPS
+                                cameraService.recordMjpegFrameServed()
+                                lastFrameServedAtMs = System.currentTimeMillis()
+                            } catch (e: Exception) {
+                                Log.d(TAG, "Stream client $clientId disconnected")
+                                break
+                            }
+                        } else if (System.currentTimeMillis() - lastFrameServedAtMs >= STREAM_NO_FRAME_TIMEOUT_MS) {
+                            Log.w(
+                                TAG,
+                                "Stream client $clientId timed out waiting for frames " +
+                                    "(${STREAM_NO_FRAME_TIMEOUT_MS}ms without data), closing stream"
+                            )
+                            break
+                        }
+
+                        // Use dynamic frame delay based on target MJPEG FPS
+                        val targetFps = cameraService.getTargetMjpegFps()
+                        val frameDelayMs = 1000L / targetFps
+                        delay(frameDelayMs)
                     }
-                    
-                    // Use dynamic frame delay based on target MJPEG FPS
-                    val targetFps = cameraService.getTargetMjpegFps()
-                    val frameDelayMs = 1000L / targetFps
-                    delay(frameDelayMs)
-                }
-            } finally {
-                // Remove this client from both tracking structures
-                val removedClient = streamClients.remove(clientId)
-                synchronized(streamClientsByIpLock) {
-                    if (streamClientByIp[clientIp] == clientId) {
-                        streamClientByIp.remove(clientIp)
+                } finally {
+                    if (leaseAcquired) {
+                        releaseStreamClient(newClient, "stream writer finished")
                     }
                 }
-                val remainingStreams = if (removedClient != null) {
-                    activeStreams.decrementAndGet().coerceAtLeast(0)
-                } else {
-                    activeStreams.get()
-                }
-                Log.d(TAG, "Stream connection closed. Client $clientId (IP: $clientIp). Active streams: $remainingStreams")
-                
-                // Unregister MJPEG consumer when last stream disconnects
-                if (remainingStreams == 0) {
-                    Log.d(TAG, "Last MJPEG stream disconnected, unregistering consumer...")
-                    cameraService.unregisterMjpegConsumer()
-                }
-                cameraService.onLongLivedConnectionsChanged()
             }
+        } finally {
+            releaseStreamClient(newClient, "request finished")
         }
     }
     
