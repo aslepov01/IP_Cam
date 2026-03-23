@@ -64,6 +64,7 @@ class RTSPServer(
     private val cameraLeaseSessions = LinkedHashSet<String>()
     private val cameraLeaseLock = Any()
     private val codecConfigLock = Any()
+    private val streamTimelineLock = Any()
     
     // Synchronization lock for start/stop operations
     private val serverLock = Any()
@@ -74,6 +75,7 @@ class RTSPServer(
     @Volatile private var sps: ByteArray? = null
     @Volatile private var pps: ByteArray? = null
     @Volatile private var codecConfigState: CodecConfigState = CodecConfigState.INVALID
+    @Volatile private var readyCodecGeneration: Long = 0L
     @Volatile private var encoderColorFormat: Int = -1
     @Volatile private var encoderColorFormatName: String = "unknown"
     
@@ -84,6 +86,9 @@ class RTSPServer(
     
     // Frame timing control
     @Volatile private var streamStartTimeMs: Long = 0
+    @Volatile private var encoderSessionGeneration: Long = 0L
+    @Volatile private var lastRawPtsUs: Long = Long.MIN_VALUE
+    @Volatile private var lastNormalizedRtpTimestamp: Long = Long.MIN_VALUE
     
     companion object {
         private const val TAG = "RTSPServer"
@@ -144,6 +149,12 @@ class RTSPServer(
         val bitrateMode: String
     )
 
+    private data class CodecConfigSnapshot(
+        val sps: ByteArray,
+        val pps: ByteArray,
+        val generation: Long
+    )
+
     private fun normalizeBitrateMode(mode: String): String = mode.uppercase()
 
     private fun getReadyCodecConfig(): Pair<ByteArray, ByteArray>? {
@@ -157,11 +168,57 @@ class RTSPServer(
         }
     }
 
+    private fun getReadyCodecConfigSnapshot(): CodecConfigSnapshot? {
+        synchronized(codecConfigLock) {
+            val currentSps = sps
+            val currentPps = pps
+            if (codecConfigState != CodecConfigState.READY || currentSps == null || currentPps == null) {
+                return null
+            }
+            return CodecConfigSnapshot(
+                sps = currentSps.copyOf(),
+                pps = currentPps.copyOf(),
+                generation = readyCodecGeneration
+            )
+        }
+    }
+
+    private fun normalizeRtpTimestamp(rawPresentationTimeUs: Long): Long {
+        synchronized(streamTimelineLock) {
+            val minFrameDurationTicks = if (targetFps > 0) {
+                maxOf(1L, 90_000L / targetFps.toLong())
+            } else {
+                3_000L
+            }
+
+            val normalizedTimestamp = if (lastNormalizedRtpTimestamp == Long.MIN_VALUE) {
+                0L
+            } else {
+                val rawDeltaUs = if (lastRawPtsUs == Long.MIN_VALUE || rawPresentationTimeUs <= lastRawPtsUs) {
+                    0L
+                } else {
+                    rawPresentationTimeUs - lastRawPtsUs
+                }
+                val rawDeltaTicks = if (rawDeltaUs > 0L) {
+                    maxOf(1L, (rawDeltaUs * 90L) / 1000L)
+                } else {
+                    0L
+                }
+                lastNormalizedRtpTimestamp + maxOf(minFrameDurationTicks, rawDeltaTicks)
+            }
+
+            lastRawPtsUs = rawPresentationTimeUs
+            lastNormalizedRtpTimestamp = normalizedTimestamp
+            return normalizedTimestamp
+        }
+    }
+
     fun invalidateCodecConfig(reason: String) {
         synchronized(codecConfigLock) {
             sps = null
             pps = null
             codecConfigState = CodecConfigState.INVALID
+            readyCodecGeneration = 0L
             frameCount.set(0)
             droppedFrameCount.set(0)
             streamStartTimeMs = 0
@@ -189,6 +246,7 @@ class RTSPServer(
         var serverRtcpPort: Int = 0
         var sequenceNumber = 0
         var timestamp: Long = 0
+        @Volatile var lastCodecGenerationSent: Long = 0L
         val ssrc = (Math.random() * Int.MAX_VALUE).toInt()
         
         // TCP interleaved mode support
@@ -197,31 +255,34 @@ class RTSPServer(
         var interleavedRtcpChannel: Int = 1
         private val tcpOutputStream: OutputStream? get() = if (useTCP && !socket.isClosed) socket.getOutputStream() else null
         
-        fun sendRTP(nalUnit: ByteArray, isKeyFrame: Boolean, presentationTimeUs: Long) {
+        fun sendAccessUnit(nalUnits: List<ByteArray>, rtpTimestamp: Long, isKeyFrame: Boolean) {
             try {
-                val rtpPackets = packetizeNALUnit(nalUnit, isKeyFrame, presentationTimeUs)
                 var totalBytesSent = 0
                 
                 if (useTCP) {
                     // TCP interleaved mode - send over RTSP socket
                     tcpOutputStream?.let { stream ->
                         var sentCount = 0
-                        rtpPackets.forEach { packet ->
-                            // RFC 2326 Section 10.12: Interleaved Binary Data
-                            // Format: $ <channel> <length_msb> <length_lsb> <data>
-                            val header = byteArrayOf(
-                                0x24, // '$' marker
-                                interleavedRtpChannel.toByte(),
-                                (packet.size shr 8).toByte(), // length MSB
-                                (packet.size and 0xFF).toByte() // length LSB
-                            )
-                            synchronized(stream) {
-                                stream.write(header)
-                                stream.write(packet)
-                                stream.flush()
-                                sentCount++
-                                totalBytesSent += header.size + packet.size
+                        synchronized(stream) {
+                            nalUnits.forEachIndexed { index, nalUnit ->
+                                val isLastNalInAccessUnit = index == nalUnits.lastIndex
+                                val rtpPackets = packetizeNALUnit(nalUnit, isLastNalInAccessUnit, rtpTimestamp)
+                                rtpPackets.forEach { packet ->
+                                    // RFC 2326 Section 10.12: Interleaved Binary Data
+                                    // Format: $ <channel> <length_msb> <length_lsb> <data>
+                                    val header = byteArrayOf(
+                                        0x24, // '$' marker
+                                        interleavedRtpChannel.toByte(),
+                                        (packet.size shr 8).toByte(), // length MSB
+                                        (packet.size and 0xFF).toByte() // length LSB
+                                    )
+                                    stream.write(header)
+                                    stream.write(packet)
+                                    totalBytesSent += header.size + packet.size
+                                    sentCount++
+                                }
                             }
+                            stream.flush()
                         }
                         if (sequenceNumber == 0) {
                             Log.d(TAG, "TCP: Sent first ${sentCount} RTP packets for session $sessionId, keyframe=$isKeyFrame")
@@ -248,16 +309,20 @@ class RTSPServer(
                     }
                     
                     var sentCount = 0
-                    rtpPackets.forEach { packet ->
-                        val dgPacket = DatagramPacket(
-                            packet,
-                            packet.size,
-                            clientAddress,
-                            clientRtpPort
-                        )
-                        socket.send(dgPacket)
-                        sentCount++
-                        totalBytesSent += packet.size
+                    nalUnits.forEachIndexed { index, nalUnit ->
+                        val isLastNalInAccessUnit = index == nalUnits.lastIndex
+                        val rtpPackets = packetizeNALUnit(nalUnit, isLastNalInAccessUnit, rtpTimestamp)
+                        rtpPackets.forEach { packet ->
+                            val dgPacket = DatagramPacket(
+                                packet,
+                                packet.size,
+                                clientAddress,
+                                clientRtpPort
+                            )
+                            socket.send(dgPacket)
+                            sentCount++
+                            totalBytesSent += packet.size
+                        }
                     }
                     
                     if (sequenceNumber < 5) {
@@ -274,13 +339,21 @@ class RTSPServer(
             }
         }
         
-        private fun packetizeNALUnit(nalUnit: ByteArray, isKeyFrame: Boolean, presentationTimeUs: Long): List<ByteArray> {
+        private fun packetizeNALUnit(
+            nalUnit: ByteArray,
+            isLastNalInAccessUnit: Boolean,
+            rtpTimestamp: Long
+        ): List<ByteArray> {
             val maxPayloadSize = 1400 // MTU - headers
             val packets = mutableListOf<ByteArray>()
             
             if (nalUnit.size <= maxPayloadSize) {
                 // Single NAL unit mode
-                val rtpPacket = createRTPPacket(nalUnit, marker = true, presentationTimeUs)
+                val rtpPacket = createRTPPacket(
+                    nalUnit,
+                    marker = isLastNalInAccessUnit,
+                    rtpTimestamp = rtpTimestamp
+                )
                 packets.add(rtpPacket)
             } else {
                 // Fragmentation Unit (FU-A) mode for large NAL units
@@ -307,7 +380,11 @@ class RTSPServer(
                     payload[1] = fuHeader
                     System.arraycopy(nalUnit, offset, payload, 2, fragmentSize)
                     
-                    val rtpPacket = createRTPPacket(payload, marker = isLast, presentationTimeUs)
+                    val rtpPacket = createRTPPacket(
+                        payload,
+                        marker = isLast && isLastNalInAccessUnit,
+                        rtpTimestamp = rtpTimestamp
+                    )
                     packets.add(rtpPacket)
                     
                     offset += fragmentSize
@@ -318,7 +395,7 @@ class RTSPServer(
             return packets
         }
         
-        private fun createRTPPacket(payload: ByteArray, marker: Boolean, presentationTimeUs: Long): ByteArray {
+        private fun createRTPPacket(payload: ByteArray, marker: Boolean, rtpTimestamp: Long): ByteArray {
             val packet = ByteArray(12 + payload.size) // RTP header (12 bytes) + payload
             
             // Byte 0: Version (2), Padding (0), Extension (0), CSRC count (0)
@@ -333,9 +410,8 @@ class RTSPServer(
             sequenceNumber++
             
             // Bytes 4-7: Timestamp (90kHz clock for video)
-            // Convert presentation time from microseconds to 90kHz RTP clock
-            // RTP uses 90kHz clock for video per RFC 3551
-            val ts = ((presentationTimeUs * 90L) / 1000L).toInt()
+            val ts = rtpTimestamp.toInt()
+            timestamp = rtpTimestamp
             packet[4] = (ts shr 24).toByte()
             packet[5] = (ts shr 16).toByte()
             packet[6] = (ts shr 8).toByte()
@@ -921,6 +997,7 @@ class RTSPServer(
 
             if (sps != null && pps != null) {
                 codecConfigState = CodecConfigState.READY
+                readyCodecGeneration = encoderSessionGeneration
             }
         }
     }
@@ -937,7 +1014,10 @@ class RTSPServer(
         if (sessions.isEmpty()) return
         
         // Parse NAL units from frame
-        val nalUnits = parseNALUnitsFromBuffer(nalUnitData)
+        val nalUnits = parseNALUnitsFromBuffer(nalUnitData).filter { it.isNotEmpty() }
+        if (nalUnits.isEmpty()) return
+        val normalizedRtpTimestamp = normalizeRtpTimestamp(presentationTimeUs)
+        val codecConfigSnapshot = if (isKeyFrame) getReadyCodecConfigSnapshot() else null
         
         if (frameCount.get() == 0L) {
             streamStartTimeMs = System.currentTimeMillis()
@@ -947,15 +1027,28 @@ class RTSPServer(
         // Track FPS
         cameraService?.recordRtspFrameEncoded()
         
-        // Send each NAL unit to all playing sessions with actual presentation time
-        nalUnits.forEach { nalUnit ->
-            if (nalUnit.isNotEmpty()) {
-                sessions.values.forEach { session ->
-                    if (session.state == SessionState.PLAYING) {
-                        session.sendRTP(nalUnit, isKeyFrame, presentationTimeUs)
-                    }
-                }
+        sessions.values.forEach { session ->
+            if (session.state != SessionState.PLAYING) {
+                return@forEach
             }
+
+            val accessUnit = if (
+                isKeyFrame &&
+                codecConfigSnapshot != null &&
+                session.lastCodecGenerationSent < codecConfigSnapshot.generation
+            ) {
+                session.lastCodecGenerationSent = codecConfigSnapshot.generation
+                Log.d(
+                    TAG,
+                    "Injecting SPS/PPS for session ${session.sessionId} before keyframe " +
+                        "(generation=${codecConfigSnapshot.generation})"
+                )
+                listOf(codecConfigSnapshot.sps, codecConfigSnapshot.pps) + nalUnits
+            } else {
+                nalUnits
+            }
+
+            session.sendAccessUnit(accessUnit, normalizedRtpTimestamp, isKeyFrame)
         }
     }
     
@@ -1218,6 +1311,10 @@ class RTSPServer(
         targetFps = session.targetFps
         bitrate = session.bitrate
         bitrateModeName = normalizeBitrateMode(session.bitrateMode)
+        synchronized(streamTimelineLock) {
+            encoderSessionGeneration += 1L
+            lastRawPtsUs = Long.MIN_VALUE
+        }
         synchronized(codecConfigLock) {
             frameCount.set(0)
             droppedFrameCount.set(0)
@@ -1225,6 +1322,7 @@ class RTSPServer(
             sps = null
             pps = null
             codecConfigState = CodecConfigState.WAITING
+            readyCodecGeneration = 0L
         }
         lastError = null
     }
