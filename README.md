@@ -154,7 +154,7 @@ Comprehensive documentation is available in the [`/documentation`](documentation
 - **[Implementation Guide](documentation/IMPLEMENTATION.md)** - Architecture and implementation details
 - **[Requirements Specification](documentation/REQUIREMENTS.md)** - Complete requirements with status
 - **[Analysis & Concepts](documentation/ANALYSIS.md)** - Architectural analysis and proposals
-- **[Testing Guide](documentation/TESTING.md)** - Testing procedures and troubleshooting
+- **[Testing Guide](documentation/TESTING.md)** - Automated core suite, device setup, and troubleshooting
 - **[Auto Update Implementation](documentation/AUTO_UPDATE_IMPLEMENTATION.md)** - OTA update system guide
 - **[Signing Setup Guide](documentation/SIGNING_SETUP.md)** - APK signing for auto updates
 
@@ -172,6 +172,21 @@ cd IP_Cam
 ./gradlew assembleDebug
 adb install app/build/outputs/apk/debug/app-debug.apk
 ```
+
+### Running Tests
+
+```bash
+./gradlew testDebugUnitTest
+./gradlew connectedDebugAndroidTest
+```
+
+To target one USB-connected device explicitly:
+
+```bash
+ANDROID_SERIAL=<device-serial> ./gradlew connectedDebugAndroidTest
+```
+
+The automated suite includes JVM unit tests plus a real-device instrumentation suite that exercises server lifecycle, camera leasing, MJPEG, SSE, RTSP, connection eviction, and cleanup scenarios. See [Testing Guide](documentation/TESTING.md) for the full coverage map and device setup notes.
 
 ## Requirements
 

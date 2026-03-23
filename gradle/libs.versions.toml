@@ -39,6 +39,9 @@ kotlinx-serialization = "1.7.3"
 junit = "4.13.2"
 androidx-test-ext-junit = "1.2.1"
 androidx-test-espresso = "3.6.1"
+androidx-test-core = "1.6.1"
+androidx-test-orchestrator = "1.5.1"
+androidx-test-uiautomator = "2.3.0"
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
@@ -82,6 +85,9 @@ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 junit = { group = "junit", name = "junit", version.ref = "junit" }
 androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidx-test-ext-junit" }
 androidx-test-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "androidx-test-espresso" }
+androidx-test-core-ktx = { group = "androidx.test", name = "core-ktx", version.ref = "androidx-test-core" }
+androidx-test-orchestrator = { group = "androidx.test", name = "orchestrator", version.ref = "androidx-test-orchestrator" }
+androidx-test-uiautomator = { group = "androidx.test.uiautomator", name = "uiautomator", version.ref = "androidx-test-uiautomator" }
 
 [bundles]
 camerax = ["androidx-camera-core", "androidx-camera-camera2", "androidx-camera-lifecycle", "androidx-camera-view"]

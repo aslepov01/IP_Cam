@@ -1,0 +1,459 @@
+package com.ipcam.testsupport
+
+import org.json.JSONObject
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.BufferedReader
+import java.io.ByteArrayOutputStream
+import java.io.Closeable
+import java.io.IOException
+import java.io.InputStreamReader
+import java.net.ConnectException
+import java.net.InetSocketAddress
+import java.net.Socket
+import java.net.SocketTimeoutException
+import kotlin.math.max
+
+data class HttpResponse(
+    val statusCode: Int,
+    val headers: Map<String, List<String>>,
+    val body: ByteArray
+) {
+    fun bodyText(): String = body.toString(Charsets.UTF_8)
+
+    fun jsonObject(): JSONObject = JSONObject(bodyText())
+}
+
+class MjpegStreamClient(
+    host: String,
+    port: Int,
+    path: String = "/stream"
+) : Closeable {
+    private val connection = openRawHttpGet(
+        host = host,
+        port = port,
+        path = path,
+        readTimeoutMs = 2_000,
+        keepAlive = true
+    )
+    private val input = connection.input
+
+    val statusCode: Int = connection.statusCode
+    val contentType: String = connection.headerValue("Content-Type").orEmpty()
+
+    fun awaitFirstJpegFrame(timeoutMs: Long = 20_000L): ByteArray {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val chunk = ByteArray(8_192)
+        val captured = ByteArrayOutputStream()
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                val read = input.read(chunk)
+                if (read == -1) {
+                    throw AssertionError("MJPEG stream closed before delivering a frame")
+                }
+                captured.write(chunk, 0, read)
+                val bytes = captured.toByteArray()
+                val start = bytes.indexOfSequence(byteArrayOf(0xFF.toByte(), 0xD8.toByte()))
+                if (start >= 0) {
+                    val end = bytes.indexOfSequence(byteArrayOf(0xFF.toByte(), 0xD9.toByte()), start + 2)
+                    if (end >= 0) {
+                        return bytes.copyOfRange(start, end + 2)
+                    }
+                }
+                trimIfNeeded(captured)
+            } catch (_: SocketTimeoutException) {
+                // Keep waiting until timeout expires.
+            }
+        }
+
+        throw AssertionError("Timed out waiting for the first JPEG frame from MJPEG stream")
+    }
+
+    fun awaitDisconnected(timeoutMs: Long = 10_000L): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val buffer = ByteArray(1_024)
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                val read = input.read(buffer)
+                if (read == -1) {
+                    return true
+                }
+            } catch (_: SocketTimeoutException) {
+                // Keep polling.
+            } catch (_: IOException) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    override fun close() {
+        connection.close()
+    }
+
+    private fun trimIfNeeded(captured: ByteArrayOutputStream) {
+        val current = captured.toByteArray()
+        if (current.size <= MAX_CAPTURE_BYTES) {
+            return
+        }
+
+        val keepFrom = max(0, current.size - MAX_CAPTURE_BYTES / 2)
+        captured.reset()
+        captured.write(current, keepFrom, current.size - keepFrom)
+    }
+
+    companion object {
+        private const val MAX_CAPTURE_BYTES = 512 * 1024
+    }
+}
+
+class SseClient(
+    host: String,
+    port: Int,
+    path: String = "/events"
+) : Closeable {
+    private val connection = openRawHttpGet(
+        host = host,
+        port = port,
+        path = path,
+        readTimeoutMs = 2_000,
+        keepAlive = true
+    )
+    private val reader = BufferedReader(InputStreamReader(connection.input))
+
+    val statusCode: Int = connection.statusCode
+    val contentType: String = connection.headerValue("Content-Type").orEmpty()
+
+    fun awaitInitialEvents(
+        requiredEvents: Set<String> = setOf("state", "metrics"),
+        timeoutMs: Long = 15_000L
+    ): Set<String> {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val observed = linkedSetOf<String>()
+
+        while (System.currentTimeMillis() < deadline && !observed.containsAll(requiredEvents)) {
+            try {
+                val line = reader.readLine() ?: break
+                if (line.startsWith("event:")) {
+                    observed += line.removePrefix("event:").trim()
+                }
+            } catch (_: SocketTimeoutException) {
+                // Keep waiting.
+            }
+        }
+
+        return observed
+    }
+
+    fun awaitDisconnected(timeoutMs: Long = 10_000L): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                val line = reader.readLine()
+                if (line == null) {
+                    return true
+                }
+            } catch (_: SocketTimeoutException) {
+                // Keep polling.
+            } catch (_: IOException) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    override fun close() {
+        connection.close()
+    }
+}
+
+data class RtspResponse(
+    val statusCode: Int,
+    val statusLine: String,
+    val headers: Map<String, String>,
+    val body: String
+)
+
+class RtspTcpClient(
+    private val host: String,
+    private val port: Int = 8554
+) : Closeable {
+    private val socket = connectRtspSocket(host, port)
+    private val input = BufferedInputStream(socket.getInputStream())
+    private val output = BufferedOutputStream(socket.getOutputStream())
+    private var cSeq = 1
+    private var sessionId: String? = null
+    private val streamUrl = "rtsp://$host:$port/stream"
+
+    fun options(): RtspResponse = sendRequest("OPTIONS", streamUrl)
+
+    fun describe(): RtspResponse =
+        sendRequest(
+            method = "DESCRIBE",
+            url = streamUrl,
+            extraHeaders = listOf("Accept: application/sdp")
+        )
+
+    fun setupTcp(interleavedStartChannel: Int = 0): RtspResponse {
+        val channelEnd = interleavedStartChannel + 1
+        return sendRequest(
+            method = "SETUP",
+            url = "$streamUrl/track0",
+            extraHeaders = listOf(
+                "Transport: RTP/AVP/TCP;unicast;interleaved=$interleavedStartChannel-$channelEnd"
+            )
+        )
+    }
+
+    fun play(): RtspResponse = sendRequest("PLAY", streamUrl)
+
+    fun pause(): RtspResponse = sendRequest("PAUSE", streamUrl)
+
+    fun teardown(): RtspResponse = sendRequest("TEARDOWN", streamUrl)
+
+    fun awaitInterleavedRtpPacket(timeoutMs: Long = 20_000L): ByteArray {
+        val deadline = System.currentTimeMillis() + timeoutMs
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                val marker = input.read()
+                if (marker == -1) {
+                    throw AssertionError("RTSP socket closed before any RTP packet was received")
+                }
+                if (marker != INTERLEAVED_MARKER) {
+                    continue
+                }
+
+                val channel = input.read()
+                val lengthMsb = input.read()
+                val lengthLsb = input.read()
+                if (channel == -1 || lengthMsb == -1 || lengthLsb == -1) {
+                    throw AssertionError("RTSP interleaved header was truncated")
+                }
+
+                val payloadLength = (lengthMsb shl 8) or lengthLsb
+                return readExact(payloadLength)
+            } catch (_: SocketTimeoutException) {
+                // Keep waiting.
+            }
+        }
+
+        throw AssertionError("Timed out waiting for interleaved RTP packet from RTSP server")
+    }
+
+    fun awaitDisconnected(timeoutMs: Long = 10_000L): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                val read = input.read()
+                if (read == -1) {
+                    return true
+                }
+            } catch (_: SocketTimeoutException) {
+                // Keep polling.
+            } catch (_: IOException) {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    override fun close() {
+        runCatching { socket.close() }
+    }
+
+    private fun sendRequest(
+        method: String,
+        url: String,
+        extraHeaders: List<String> = emptyList()
+    ): RtspResponse {
+        val requestBuilder = StringBuilder()
+        requestBuilder.append("$method $url RTSP/1.0\r\n")
+        requestBuilder.append("CSeq: ${cSeq++}\r\n")
+        sessionId?.let { requestBuilder.append("Session: $it\r\n") }
+        extraHeaders.forEach { requestBuilder.append(it).append("\r\n") }
+        requestBuilder.append("\r\n")
+
+        output.write(requestBuilder.toString().toByteArray(Charsets.UTF_8))
+        output.flush()
+
+        val response = readResponse()
+        response.headers["session"]?.let { rawSession ->
+            sessionId = rawSession.substringBefore(';').trim()
+        }
+        return response
+    }
+
+    private fun readResponse(): RtspResponse {
+        val statusLine = readRtspStatusLine()
+        val headers = linkedMapOf<String, String>()
+
+        while (true) {
+            val line = readAsciiLine()
+                ?: throw AssertionError("Expected RTSP headers but socket closed")
+            if (line.isEmpty()) {
+                break
+            }
+
+            val separator = line.indexOf(':')
+            if (separator > 0) {
+                val name = line.substring(0, separator).trim().lowercase()
+                val value = line.substring(separator + 1).trim()
+                headers[name] = value
+            }
+        }
+
+        val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
+        val body = if (contentLength > 0) {
+            readExact(contentLength).toString(Charsets.UTF_8)
+        } else {
+            ""
+        }
+
+        val statusCode = statusLine.split(' ')
+            .getOrNull(1)
+            ?.toIntOrNull()
+            ?: throw AssertionError("Could not parse RTSP status code from '$statusLine'")
+
+        return RtspResponse(
+            statusCode = statusCode,
+            statusLine = statusLine,
+            headers = headers,
+            body = body
+        )
+    }
+
+    private fun readRtspStatusLine(): String {
+        while (true) {
+            val first = input.read()
+            if (first == -1) {
+                throw AssertionError("Expected RTSP response status line but socket closed")
+            }
+
+            if (first == INTERLEAVED_MARKER) {
+                skipInterleavedPacket()
+                continue
+            }
+
+            val line = readAsciiLine(first)
+                ?: throw AssertionError("Expected RTSP response status line but socket closed")
+            if (line.startsWith("RTSP/")) {
+                return line
+            }
+        }
+    }
+
+    private fun skipInterleavedPacket() {
+        val channel = input.read()
+        val lengthMsb = input.read()
+        val lengthLsb = input.read()
+        if (channel == -1 || lengthMsb == -1 || lengthLsb == -1) {
+            throw AssertionError("RTSP interleaved header was truncated while waiting for response")
+        }
+
+        val payloadLength = (lengthMsb shl 8) or lengthLsb
+        readExact(payloadLength)
+    }
+
+    private fun readAsciiLine(): String? {
+        val first = input.read()
+        if (first == -1) {
+            return null
+        }
+        return readAsciiLine(first)
+    }
+
+    private fun readAsciiLine(firstByte: Int): String? {
+        val line = ByteArrayOutputStream()
+        var previous = firstByte
+        line.write(firstByte)
+
+        while (true) {
+            val next = input.read()
+            if (next == -1) {
+                return if (line.size() == 0) null else line.toString(Charsets.UTF_8.name())
+            }
+
+            if (previous == '\r'.code && next == '\n'.code) {
+                val raw = line.toByteArray()
+                return raw.copyOf(raw.size - 1).toString(Charsets.UTF_8)
+            }
+
+            line.write(next)
+            previous = next
+        }
+    }
+
+    private fun readExact(length: Int): ByteArray {
+        val buffer = ByteArray(length)
+        var offset = 0
+
+        while (offset < length) {
+            val read = input.read(buffer, offset, length - offset)
+            if (read == -1) {
+                throw AssertionError("Expected $length bytes but socket closed after $offset bytes")
+            }
+            offset += read
+        }
+
+        return buffer
+    }
+
+    companion object {
+        private const val INTERLEAVED_MARKER = 0x24
+
+        private fun connectRtspSocket(host: String, port: Int, timeoutMs: Long = 15_000L): Socket {
+            val deadline = System.currentTimeMillis() + timeoutMs
+            var lastError: IOException? = null
+
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    return Socket().apply {
+                        connect(InetSocketAddress(host, port), 2_000)
+                        soTimeout = 2_000
+                    }
+                } catch (error: IOException) {
+                    lastError = error
+                    runCatching { Thread.sleep(250) }
+                }
+            }
+
+            throw ConnectException("Failed to connect to RTSP server at $host:$port").also {
+                if (lastError != null) {
+                    it.initCause(lastError)
+                }
+            }
+        }
+    }
+}
+
+private fun ByteArray.indexOfSequence(
+    sequence: ByteArray,
+    startIndex: Int = 0
+): Int {
+    if (sequence.isEmpty() || this.size < sequence.size || startIndex >= this.size) {
+        return -1
+    }
+
+    for (index in startIndex..this.size - sequence.size) {
+        var matches = true
+        for (offset in sequence.indices) {
+            if (this[index + offset] != sequence[offset]) {
+                matches = false
+                break
+            }
+        }
+        if (matches) {
+            return index
+        }
+    }
+
+    return -1
+}

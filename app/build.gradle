@@ -78,6 +78,7 @@ android {
         versionName versionProps['VERSION_NAME']
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        testInstrumentationRunnerArguments clearPackageData: 'true'
         
         // Build configuration fields for version/build info
         buildConfigField "String", "GIT_COMMIT_HASH", "\"${getGitCommitHash()}\""
@@ -102,6 +103,13 @@ android {
     buildFeatures {
         viewBinding true
         buildConfig true
+    }
+    testOptions {
+        execution 'ANDROIDX_TEST_ORCHESTRATOR'
+        animationsDisabled true
+    }
+    adbOptions {
+        installOptions '-g'
     }
 }
 
@@ -128,5 +136,8 @@ dependencies {
     
     testImplementation libs.junit
     androidTestImplementation libs.androidx.test.ext.junit
+    androidTestImplementation libs.androidx.test.core.ktx
     androidTestImplementation libs.androidx.test.espresso.core
+    androidTestImplementation libs.androidx.test.uiautomator
+    androidTestUtil libs.androidx.test.orchestrator
 }

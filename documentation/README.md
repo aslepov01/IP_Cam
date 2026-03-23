@@ -35,10 +35,10 @@ These are the primary documents providing complete overview of the project:
 
 ### [TESTING.md](TESTING.md)
 **Testing procedures and guides:**
-- Manual testing procedures
-- Automated testing scripts
-- Performance testing benchmarks
-- Compatibility testing (surveillance systems, media players, browsers)
+- JVM unit tests for core runtime logic
+- Real-device instrumentation suite for lifecycle and streaming behavior
+- `adb` execution flow and device prerequisites
+- Manual exploratory checks and compatibility validation
 - Troubleshooting guide
 
 ### [HISTORY.md](HISTORY.md)
