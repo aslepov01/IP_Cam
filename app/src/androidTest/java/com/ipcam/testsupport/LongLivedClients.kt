@@ -43,27 +43,14 @@ class MjpegStreamClient(
 
     fun awaitFirstJpegFrame(timeoutMs: Long = 20_000L): ByteArray {
         val deadline = System.currentTimeMillis() + timeoutMs
-        val chunk = ByteArray(8_192)
-        val captured = ByteArrayOutputStream()
 
         while (System.currentTimeMillis() < deadline) {
             try {
-                val read = input.read(chunk)
-                if (read == -1) {
-                    throw AssertionError("MJPEG stream closed before delivering a frame")
-                }
-                captured.write(chunk, 0, read)
-                val bytes = captured.toByteArray()
-                val start = bytes.indexOfSequence(byteArrayOf(0xFF.toByte(), 0xD8.toByte()))
-                if (start >= 0) {
-                    val end = bytes.indexOfSequence(byteArrayOf(0xFF.toByte(), 0xD9.toByte()), start + 2)
-                    if (end >= 0) {
-                        return bytes.copyOfRange(start, end + 2)
-                    }
-                }
-                trimIfNeeded(captured)
+                return readNextJpegFrameByMarkerScan()
             } catch (_: SocketTimeoutException) {
                 // Keep waiting until timeout expires.
+            } catch (_: java.io.EOFException) {
+                throw AssertionError("MJPEG stream closed before delivering a frame")
             }
         }
 
@@ -94,6 +81,28 @@ class MjpegStreamClient(
         connection.close()
     }
 
+    private fun readNextJpegFrameByMarkerScan(): ByteArray {
+        val chunk = ByteArray(8_192)
+        val captured = ByteArrayOutputStream()
+
+        while (true) {
+            val read = input.read(chunk)
+            if (read == -1) {
+                throw java.io.EOFException("MJPEG stream closed before delivering a frame")
+            }
+            captured.write(chunk, 0, read)
+            val bytes = captured.toByteArray()
+            val start = bytes.indexOfSequence(byteArrayOf(0xFF.toByte(), 0xD8.toByte()))
+            if (start >= 0) {
+                val end = bytes.indexOfSequence(byteArrayOf(0xFF.toByte(), 0xD9.toByte()), start + 2)
+                if (end >= 0) {
+                    return bytes.copyOfRange(start, end + 2)
+                }
+            }
+            trimIfNeeded(captured)
+        }
+    }
+
     private fun trimIfNeeded(captured: ByteArrayOutputStream) {
         val current = captured.toByteArray()
         if (current.size <= MAX_CAPTURE_BYTES) {
@@ -106,7 +115,7 @@ class MjpegStreamClient(
     }
 
     companion object {
-        private const val MAX_CAPTURE_BYTES = 512 * 1024
+        private const val MAX_CAPTURE_BYTES = 16 * 1024 * 1024
     }
 }
 

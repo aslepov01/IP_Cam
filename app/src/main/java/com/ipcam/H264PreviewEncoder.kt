@@ -6,6 +6,7 @@ import android.media.MediaFormat
 import android.util.Log
 import android.view.Surface
 import java.nio.ByteBuffer
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Custom H.264 encoder that receives frames from CameraX Preview
@@ -30,12 +31,16 @@ class H264PreviewEncoder(
         private const val TAG = "H264PreviewEncoder"
         private const val MIME_TYPE = MediaFormat.MIMETYPE_VIDEO_AVC
         private const val I_FRAME_INTERVAL = 2 // seconds
+        private val activeEncoderInstances = AtomicInteger(0)
+
+        fun getActiveEncoderInstances(): Int = activeEncoderInstances.get()
     }
     
     private var encoder: MediaCodec? = null
     private var inputSurface: Surface? = null
     private var isRunning = false
     private var drainThread: Thread? = null
+    private var countedAsActive = false
     
     /**
      * Get the input surface to attach to CameraX Preview
@@ -96,6 +101,8 @@ class H264PreviewEncoder(
             // Start encoder
             encoder?.start()
             isRunning = true
+            countedAsActive = true
+            activeEncoderInstances.incrementAndGet()
 
             reportEncoderSessionStarted()
             
@@ -378,6 +385,16 @@ class H264PreviewEncoder(
             Log.i(TAG, "H.264 encoder stopped")
         } catch (e: Exception) {
             Log.e(TAG, "Error stopping encoder", e)
+        } finally {
+            if (countedAsActive) {
+                countedAsActive = false
+                val remaining = activeEncoderInstances.decrementAndGet()
+                if (remaining < 0) {
+                    activeEncoderInstances.set(0)
+                    Log.w(TAG, "Active encoder counter went below zero during stop(); counter was reset")
+                }
+                Log.d(TAG, "Active H.264 encoders after stop: ${activeEncoderInstances.get()}")
+            }
         }
     }
     

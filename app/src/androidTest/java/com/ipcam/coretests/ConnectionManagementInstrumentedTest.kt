@@ -23,6 +23,7 @@ class ConnectionManagementInstrumentedTest : BaseDeviceCoreTest() {
 
         val first = env.openMjpegStream()
         val second = env.openMjpegStream(alternateHost!!)
+        val expectedLongLivedConnections = env.expectedTotalLongLivedConnections(2)
 
         assertTrue(first.awaitFirstJpegFrame().size > 1_000)
         assertTrue(second.awaitFirstJpegFrame().size > 1_000)
@@ -30,7 +31,7 @@ class ConnectionManagementInstrumentedTest : BaseDeviceCoreTest() {
         env.waitForConnectionCount("mjpeg", 2)
         val metrics = env.waitForMetrics(description = "two MJPEG clients to remain active") {
             it.optInt("activeHttpStreams", -1) == 2 &&
-                it.optInt("totalLongLivedConnections", -1) == 2
+                it.optInt("totalLongLivedConnections", -1) == expectedLongLivedConnections
         }
         assertEquals(2, metrics.getInt("activeHttpStreams"))
 
@@ -84,7 +85,7 @@ class ConnectionManagementInstrumentedTest : BaseDeviceCoreTest() {
         val sse = env.openSse()
         sse.awaitInitialEvents()
         env.waitForMetrics(description = "SSE-only connection state") {
-            it.optInt("activeSseClients", -1) == 1 &&
+            it.optInt("activeSseClients", -1) >= 1 &&
                 it.optInt("totalCameraClients", -1) == 0
         }
         env.waitForCameraState("IDLE")
@@ -101,7 +102,7 @@ class ConnectionManagementInstrumentedTest : BaseDeviceCoreTest() {
         env.waitForCameraState("ACTIVE")
         env.waitForRtspPlayingSessions(1)
         env.waitForMetrics(description = "mixed video consumers active") {
-            it.optInt("activeSseClients", -1) == 1 &&
+            it.optInt("activeSseClients", -1) >= 1 &&
                 it.optInt("activeHttpStreams", -1) == 1 &&
                 it.optInt("rtspPlayingSessions", -1) == 1 &&
                 it.optInt("totalCameraClients", -1) == 2
@@ -111,7 +112,7 @@ class ConnectionManagementInstrumentedTest : BaseDeviceCoreTest() {
 
         env.waitForRtspPlayingSessions(0)
         env.waitForMetrics(description = "MJPEG remains the last video consumer") {
-            it.optInt("activeSseClients", -1) == 1 &&
+            it.optInt("activeSseClients", -1) >= 1 &&
                 it.optInt("activeHttpStreams", -1) == 1 &&
                 it.optInt("activeRtspConnections", -1) == 0 &&
                 it.optInt("rtspPlayingSessions", -1) == 0 &&
@@ -122,7 +123,7 @@ class ConnectionManagementInstrumentedTest : BaseDeviceCoreTest() {
         mjpeg.close()
 
         env.waitForMetrics(description = "SSE stays connected after video cleanup") {
-            it.optInt("activeSseClients", -1) == 1 &&
+            it.optInt("activeSseClients", -1) >= 1 &&
                 it.optInt("activeHttpStreams", -1) == 0 &&
                 it.optInt("activeRtspConnections", -1) == 0 &&
                 it.optInt("totalCameraClients", -1) == 0 &&

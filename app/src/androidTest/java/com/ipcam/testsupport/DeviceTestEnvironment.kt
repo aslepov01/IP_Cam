@@ -29,15 +29,21 @@ class DeviceTestEnvironment {
     private val trackedCloseables = mutableListOf<Closeable>()
     private var mainActivityScenario: ActivityScenario<MainActivity>? = null
     private val localConnectionAddresses: Set<String> by lazy { discoverLocalConnectionAddresses() }
+    private var baselineActiveSseClients: Int = 0
+    private var baselineLongLivedConnections: Int = 0
 
     fun startFreshApp() {
         shutdownAndReset()
         seedUiPreferences()
-        launchMainActivity()
+        val permissionsPreGranted = preGrantRuntimePermissions()
+        launchMainActivity(fromCameraActivation = permissionsPreGranted)
+        if (!permissionsPreGranted) {
+            ensureRuntimePermissionsGranted()
+        }
         startHttpServer()
-        ensureRuntimePermissionsGranted()
         waitForHttpServer()
         waitForCameraCatalogReady()
+        captureBaselineLongLivedTelemetry()
     }
 
     fun shutdownAndReset() {
@@ -52,6 +58,8 @@ class DeviceTestEnvironment {
 
         clearPreferences()
         deleteExternalFiles()
+        baselineActiveSseClients = 0
+        baselineLongLivedConnections = 0
     }
 
     fun httpGet(
@@ -172,6 +180,21 @@ class DeviceTestEnvironment {
         }
     }
 
+    fun waitForRtspActiveEncoderCount(
+        expectedCount: Int,
+        timeoutMs: Long = 15_000L
+    ): JSONObject {
+        return waitUntil(timeoutMs, "active RTSP encoders == $expectedCount") {
+            val status = jsonGet("/rtspStatus")
+            if (status.optInt("activeEncoders", -1) == expectedCount) status else null
+        }
+    }
+
+    fun expectedActiveSseClients(localSseClients: Int): Int = baselineActiveSseClients + localSseClients
+
+    fun expectedTotalLongLivedConnections(localConnections: Int): Int =
+        baselineLongLivedConnections + localConnections
+
     fun waitForSelectedCamera(
         cameraId: String,
         timeoutMs: Long = 20_000L
@@ -234,16 +257,18 @@ class DeviceTestEnvironment {
         expectedSseClients: Int = 0,
         timeoutMs: Long = 25_000L
     ): JSONObject {
+        val expectedActiveSseClients = baselineActiveSseClients + expectedSseClients
+        val expectedLongLivedConnections = baselineLongLivedConnections + expectedSseClients
         return waitForMetrics(
             timeoutMs = timeoutMs,
             description = "streaming telemetry to become idle"
         ) { metrics ->
             metrics.optInt("activeHttpStreams", -1) == 0 &&
-                metrics.optInt("activeSseClients", -1) == expectedSseClients &&
+                metrics.optInt("activeSseClients", -1) == expectedActiveSseClients &&
                 metrics.optInt("activeRtspConnections", -1) == 0 &&
                 metrics.optInt("rtspPlayingSessions", -1) == 0 &&
                 metrics.optInt("totalCameraClients", -1) == 0 &&
-                metrics.optInt("totalLongLivedConnections", -1) == expectedSseClients &&
+                metrics.optInt("totalLongLivedConnections", -1) == expectedLongLivedConnections &&
                 metrics.optDouble("currentMjpegFps", -1.0) <= 0.01 &&
                 metrics.optDouble("currentRtspFps", -1.0) <= 0.01 &&
                 metrics.optLong("mjpegBandwidthBps", -1L) == 0L &&
@@ -284,18 +309,23 @@ class DeviceTestEnvironment {
         waitForPortClosedOrServiceStopped(8080)
         waitForPortClosedOrServiceStopped(8554)
 
-        launchMainActivity()
+        val permissionsPreGranted = preGrantRuntimePermissions()
+        launchMainActivity(fromCameraActivation = permissionsPreGranted)
+        if (!permissionsPreGranted) {
+            ensureRuntimePermissionsGranted()
+        }
         startHttpServer()
-        ensureRuntimePermissionsGranted()
         waitForHttpServer()
         waitForCameraCatalogReady()
     }
 
-    private fun launchMainActivity() {
+    private fun launchMainActivity(fromCameraActivation: Boolean) {
         runShell("wm dismiss-keyguard")
         val intent = Intent(appContext, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            putExtra("FROM_CAMERA_ACTIVATION", true)
+            if (fromCameraActivation) {
+                putExtra("FROM_CAMERA_ACTIVATION", true)
+            }
         }
         mainActivityScenario = ActivityScenario.launch(intent)
         instrumentation.waitForIdleSync()
@@ -328,6 +358,32 @@ class DeviceTestEnvironment {
             runCatching { closeable.close() }
         }
         trackedCloseables.clear()
+    }
+
+    private fun captureBaselineLongLivedTelemetry(windowMs: Long = 4_000L) {
+        val deadline = System.currentTimeMillis() + windowMs
+        var maxObservedSseClients = 0
+        var maxObservedLongLivedConnections = 0
+
+        while (System.currentTimeMillis() < deadline) {
+            val metrics = runCatching { metrics() }.getOrNull()
+            if (metrics != null &&
+                metrics.optInt("activeHttpStreams", -1) == 0 &&
+                metrics.optInt("activeRtspConnections", -1) == 0 &&
+                metrics.optInt("rtspPlayingSessions", -1) == 0 &&
+                metrics.optInt("totalCameraClients", -1) == 0
+            ) {
+                maxObservedSseClients = maxOf(maxObservedSseClients, metrics.optInt("activeSseClients", 0))
+                maxObservedLongLivedConnections = maxOf(
+                    maxObservedLongLivedConnections,
+                    metrics.optInt("totalLongLivedConnections", 0)
+                )
+            }
+            Thread.sleep(POLL_INTERVAL_MS)
+        }
+
+        baselineActiveSseClients = maxObservedSseClients
+        baselineLongLivedConnections = maxObservedLongLivedConnections
     }
 
     private fun closeAllConnectionsIfPossible() {
@@ -403,20 +459,13 @@ class DeviceTestEnvironment {
     }
 
     private fun ensureRuntimePermissionsGranted() {
-        val permissions = buildList {
-            add(Manifest.permission.CAMERA)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                add(Manifest.permission.POST_NOTIFICATIONS)
-            }
-        }
-
-        permissions.forEach { permission ->
+        requiredRuntimePermissions().forEach { permission ->
             attemptRuntimePermissionGrant(permission)
         }
 
         acceptRuntimePermissionDialogsIfPresent()
 
-        permissions.forEach { permission ->
+        requiredRuntimePermissions().forEach { permission ->
             if (ContextCompat.checkSelfPermission(appContext, permission) != PackageManager.PERMISSION_GRANTED) {
                 acceptRuntimePermissionDialogsIfPresent()
             }
@@ -428,6 +477,25 @@ class DeviceTestEnvironment {
                     null
                 }
             }
+        }
+    }
+
+    private fun preGrantRuntimePermissions(): Boolean {
+        requiredRuntimePermissions().forEach { permission ->
+            attemptRuntimePermissionGrant(permission)
+        }
+        return hasAllRuntimePermissions()
+    }
+
+    private fun hasAllRuntimePermissions(): Boolean =
+        requiredRuntimePermissions().all { permission ->
+            ContextCompat.checkSelfPermission(appContext, permission) == PackageManager.PERMISSION_GRANTED
+        }
+
+    private fun requiredRuntimePermissions(): List<String> = buildList {
+        add(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            add(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
 

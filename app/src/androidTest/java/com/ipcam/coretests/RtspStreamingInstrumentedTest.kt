@@ -212,6 +212,47 @@ class RtspStreamingInstrumentedTest : BaseDeviceCoreTest() {
         env.waitForCameraState("IDLE")
     }
 
+    // Verifies the manual reset path under an active RTSP stream. Resetting the camera must not
+    // accumulate extra H.264 encoder instances; the stream should recover with exactly one active
+    // encoder and teardown must return the runtime to zero active encoders.
+    @Test
+    fun resettingCameraDuringActiveRtspStreamDoesNotLeakEncoderThreads() {
+        env.ensureRtspEnabled()
+        env.waitForRtspActiveEncoderCount(0)
+
+        val client = env.openRtspTcp()
+        assertEquals(200, client.describe().statusCode)
+        assertEquals(200, client.setupTcp().statusCode)
+        assertEquals(200, client.play().statusCode)
+        client.awaitInterleavedRtpPacket()
+
+        env.waitForRtspPlayingSessions(1)
+        env.waitForCameraState("ACTIVE")
+        assertEquals(1, env.waitForRtspActiveEncoderCount(1).getInt("activeEncoders"))
+
+        repeat(2) { resetIndex ->
+            val reset = env.jsonGet("/resetCamera")
+            assertEquals("ok", reset.getString("status"))
+
+            client.awaitInterleavedRtpPacket()
+            env.waitForRtspPlayingSessions(1)
+            env.waitForCameraState("ACTIVE")
+            assertEquals(
+                "reset ${resetIndex + 1} must not leak an extra H.264 encoder instance",
+                1,
+                env.waitForRtspActiveEncoderCount(1).getInt("activeEncoders")
+            )
+        }
+
+        assertEquals(200, client.teardown().statusCode)
+        client.close()
+
+        env.waitForRtspPlayingSessions(0)
+        env.waitForNoLongLivedConnections()
+        env.waitForCameraState("IDLE")
+        assertEquals(0, env.waitForRtspActiveEncoderCount(0).getInt("activeEncoders"))
+    }
+
     private fun findFirstConnectionId(kind: String): String {
         val connections: JSONArray = env.connectionSnapshots()
         for (index in 0 until connections.length()) {

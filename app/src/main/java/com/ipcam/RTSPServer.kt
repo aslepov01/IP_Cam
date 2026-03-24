@@ -1288,6 +1288,7 @@ class RTSPServer(
             resolution = "${width}x${height}",
             bitrateMbps = bitrate / 1_000_000f,
             bitrateMode = bitrateModeName,
+            activeEncoders = H264PreviewEncoder.getActiveEncoderInstances(),
             activeSessions = sessions.size,
             playingSessions = sessions.values.count { it.state == SessionState.PLAYING },
             maxSessions = cameraService?.getConnectionLimits()?.maxRtspSessions
@@ -1353,6 +1354,7 @@ class RTSPServer(
         val resolution: String,
         val bitrateMbps: Float,
         val bitrateMode: String,
+        val activeEncoders: Int,
         val activeSessions: Int,
         val playingSessions: Int,
         /** Maximum concurrent RTSP playing sessions allowed. */

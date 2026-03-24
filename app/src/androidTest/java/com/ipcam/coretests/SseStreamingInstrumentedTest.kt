@@ -37,19 +37,20 @@ class SseStreamingInstrumentedTest : BaseDeviceCoreTest() {
 
         val sse = env.openSse()
         val events = sse.awaitInitialEvents()
+        val expectedSseClients = env.expectedActiveSseClients(1)
 
         assertTrue("Expected initial SSE state event", events.contains("state"))
         assertTrue("Expected initial SSE metrics event", events.contains("metrics"))
 
         val metrics = env.waitForMetrics(description = "SSE-only telemetry state") {
-            it.optInt("activeSseClients", -1) == 1 &&
+            it.optInt("activeSseClients", -1) == expectedSseClients &&
                 it.optInt("activeHttpStreams", -1) == 0 &&
                 it.optInt("activeRtspConnections", -1) == 0 &&
                 it.optInt("rtspPlayingSessions", -1) == 0 &&
                 it.optInt("totalCameraClients", -1) == 0
         }
 
-        assertEquals(1, metrics.getInt("activeSseClients"))
+        assertEquals(expectedSseClients, metrics.getInt("activeSseClients"))
         env.waitForCameraState("IDLE")
 
         sse.close()

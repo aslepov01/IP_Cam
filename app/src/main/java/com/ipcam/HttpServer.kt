@@ -1508,12 +1508,12 @@ class HttpServer(
             val bitrateMbps = metrics.bitrateMbps
             val bitrateMode = metrics.bitrateMode
             call.respondText(
-                """{"status":"ok","rtspEnabled":true,"encoder":"$encoderName","isHardware":${metrics.isHardware},"colorFormat":"$colorFormat","colorFormatHex":"$colorFormatHex","resolution":"$resolution","bitrateMbps":$bitrateMbps,"bitrateMode":"$bitrateMode","activeSessions":${metrics.activeSessions},"playingSessions":${metrics.playingSessions},"maxSessions":${metrics.maxSessions},"framesEncoded":${metrics.framesEncoded},"droppedFrames":${metrics.droppedFrames},"targetFps":${metrics.targetFps},"encodedFps":${metrics.encodedFps},"currentRtspBandwidthBps":${telemetry.rtspBandwidthBps},"currentStreamingBandwidthBps":${telemetry.bandwidthBps},"url":"$rtspUrl","port":8554}""",
+                """{"status":"ok","rtspEnabled":true,"encoder":"$encoderName","isHardware":${metrics.isHardware},"colorFormat":"$colorFormat","colorFormatHex":"$colorFormatHex","resolution":"$resolution","bitrateMbps":$bitrateMbps,"bitrateMode":"$bitrateMode","activeEncoders":${metrics.activeEncoders},"activeSessions":${metrics.activeSessions},"playingSessions":${metrics.playingSessions},"maxSessions":${metrics.maxSessions},"framesEncoded":${metrics.framesEncoded},"droppedFrames":${metrics.droppedFrames},"targetFps":${metrics.targetFps},"encodedFps":${metrics.encodedFps},"currentRtspBandwidthBps":${telemetry.rtspBandwidthBps},"currentStreamingBandwidthBps":${telemetry.bandwidthBps},"url":"$rtspUrl","port":8554}""",
                 ContentType.Application.Json
             )
         } else {
             call.respondText(
-                """{"status":"ok","rtspEnabled":false,"currentRtspBandwidthBps":${telemetry.rtspBandwidthBps},"currentStreamingBandwidthBps":${telemetry.bandwidthBps},"message":"RTSP streaming is not enabled"}""",
+                """{"status":"ok","rtspEnabled":false,"activeEncoders":${H264PreviewEncoder.getActiveEncoderInstances()},"currentRtspBandwidthBps":${telemetry.rtspBandwidthBps},"currentStreamingBandwidthBps":${telemetry.bandwidthBps},"message":"RTSP streaming is not enabled"}""",
                 ContentType.Application.Json
             )
         }

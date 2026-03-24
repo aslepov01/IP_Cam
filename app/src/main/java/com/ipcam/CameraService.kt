@@ -962,6 +962,8 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     @Volatile private var rtspEnabled: Boolean = false
     @Volatile private var rtspBitrate: Int = -1 // Saved bitrate setting (-1 = auto/default)
     @Volatile private var rtspBitrateMode: String = "VBR" // Saved bitrate mode setting
+    @Volatile private var fullCameraResetInProgress: Boolean = false
+    private val fullCameraResetLock = Any()
     
     // WiFi debugging manager for remote access (Device Owner only)
     private var wifiDebuggingManager: WiFiDebuggingManager? = null
@@ -1548,6 +1550,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
 
         try {
             detachCameraStateObserver()
+            clearRtspPipeline("pre-bind replacement")
+            clearPlaceholderPreviewPipeline("pre-bind replacement")
+            imageAnalysis?.clearAnalyzer()
             Log.d(TAG, "Unbinding all use cases before rebinding...")
             cameraProvider?.unbindAll()
             camera = null
@@ -1850,6 +1855,14 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      * @return true if reset was initiated successfully
      */
     override fun fullCameraReset(): Boolean {
+        synchronized(fullCameraResetLock) {
+            if (fullCameraResetInProgress) {
+                Log.w(TAG, "fullCameraReset() requested while another reset is already running; reusing in-flight reset")
+                return true
+            }
+            fullCameraResetInProgress = true
+        }
+
         Log.w(TAG, "fullCameraReset() - Performing DEEP camera service reset...")
         Log.i(TAG, "Pre-reset state: camera=$camera, provider=$cameraProvider, imageAnalysis=$imageAnalysis, state=$cameraState")
 
@@ -1938,6 +1951,10 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             // Restart camera if consumers are waiting
             if (hasConsumers()) {
                 Log.i(TAG, "fullCameraReset() - Restarting camera for ${getConsumerCount()} consumers")
+                synchronized(cameraStateLock) {
+                    cameraState = CameraState.INITIALIZING
+                }
+                noteCameraStartup("full camera reset restart")
                 // startCamera() will reacquire ProcessCameraProvider from scratch
                 startCamera()
             } else {
@@ -1953,6 +1970,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 cameraState = CameraState.ERROR
             }
             false
+        } finally {
+            fullCameraResetInProgress = false
+            Log.d(TAG, "fullCameraReset() - Reset gate cleared")
         }
     }
 
@@ -3919,7 +3939,9 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 val startupGraceActive = isWithinCameraStartupGracePeriod(now)
                 
                 if (hasActiveConsumers) {
-                    if (bindingInProgress) {
+                    if (fullCameraResetInProgress) {
+                        Log.d(TAG, "Watchdog: Full camera reset in progress, skipping recovery checks")
+                    } else if (bindingInProgress) {
                         Log.d(TAG, "Watchdog: Managed rebind in progress, skipping recovery checks")
                     } else if (currentCameraLifecycleState == CameraState.INITIALIZING ||
                         currentCameraLifecycleState == CameraState.STOPPING) {
@@ -4824,6 +4846,11 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
      * Activate camera when first consumer appears
      */
     private fun activateCameraForConsumers() {
+        if (fullCameraResetInProgress) {
+            Log.d(TAG, "Camera activation deferred - full camera reset is in progress")
+            return
+        }
+
         synchronized(cameraStateLock) {
             when (cameraState) {
                 CameraState.IDLE -> {
