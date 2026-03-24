@@ -14,10 +14,14 @@ Automated coverage currently includes:
 - one-shot snapshot capture
 - camera catalog validation and camera switching
 - format selection and connection limit normalization
+- flashlight API behavior on flash and non-flash cameras
+- persisted camera selection, resolution, and rotation across app restart
+- live camera and format reconfiguration under active MJPEG and RTSP streams
 - MJPEG streaming, eviction, and cleanup
 - SSE streaming, eviction, and targeted shutdown
 - RTSP handshake, playback, pause/resume, eviction, and shutdown
 - mixed SSE + MJPEG + RTSP consumer scenarios
+- server reachability after MainActivity closes
 - connection accounting and runtime telemetry quiescence
 
 Manual testing remains useful for browser UX, external client compatibility, OTA flows, and long-duration thermal checks, but core regressions should be caught by the automated suite first.
@@ -48,6 +52,9 @@ Run:
 Location:
 - `app/src/androidTest/java/com/ipcam/coretests`
 - `app/src/androidTest/java/com/ipcam/testsupport`
+
+Current suite size:
+- 32 real-device instrumentation tests
 
 Covered areas by class:
 
@@ -87,7 +94,23 @@ Covered areas by class:
 - `ConnectionManagementInstrumentedTest`
   - mixed SSE + MJPEG + RTSP connection accounting
   - camera remains active until the last video consumer disconnects
+  - concurrent MJPEG streams from distinct client addresses
   - targeted MJPEG shutdown through `/closeConnection`
+
+- `DynamicReconfigurationInstrumentedTest`
+  - camera switching while MJPEG is already streaming
+  - format changes while MJPEG is already streaming
+  - camera switching while RTSP is already playing
+  - format changes while RTSP is already playing
+
+- `FlashlightAndPersistenceInstrumentedTest`
+  - flashlight `toggle`, `flashOn`, and `flashOff` on flash-capable cameras
+  - graceful flashlight rejection on cameras without flash
+  - persistence of selected camera, format, and rotation across app restart
+
+- `ServicePersistenceInstrumentedTest`
+  - server remains reachable after MainActivity closes
+  - snapshot capture still works after the activity is gone
 
 Run:
 
@@ -173,14 +196,12 @@ Keep these scenarios in the regression checklist:
   - verify the displayed server URL matches actual reachability
 
 - Flashlight behavior
-  - toggle flashlight on a flash-capable camera
-  - switch to a camera without flash support
-  - verify graceful fallback and state consistency
+  - verify physical LED behavior on real hardware
+  - verify visual/UX behavior in the app UI and web UI
 
 - Stream reconfiguration under active load
-  - switch camera while MJPEG or RTSP clients are already active
-  - change resolution or format while clients are active
-  - verify streams recover without black frames or stuck pipeline
+  - stress longer reconfiguration sequences, not just one switch
+  - verify repeated rebinds do not degrade over time
 
 - Long-running stability
   - keep MJPEG running for 30+ minutes
@@ -188,14 +209,14 @@ Keep these scenarios in the regression checklist:
   - watch for freezes, drift, reconnect loops, or resource growth
 
 - High-load behavior
-  - open many concurrent MJPEG clients
+  - open many concurrent MJPEG clients, not just small-count automated checks
   - watch non-stream endpoints during load
   - verify no starvation, runaway CPU, or broken cleanup
 
 - Background persistence and process lifecycle
-  - send app to background
-  - dismiss from recents
-  - verify service continuity and stream availability
+  - send app to background and verify continuity
+  - dismiss from recents and verify service continuity
+  - validate full task-removal behavior beyond simple activity close
 
 - Network change recovery
   - disconnect and reconnect Wi-Fi
@@ -206,9 +227,8 @@ Keep these scenarios in the regression checklist:
   - verify restart timing and state recovery
 
 - Settings persistence across restart
-  - persist camera selection, rotation, format, and flashlight-related state
-  - force stop or relaunch
-  - verify configuration restoration
+  - validate additional persisted settings beyond camera, format, and rotation
+  - force-stop-specific behavior remains manual because force-stopping the target package also kills instrumentation
 
 - External client compatibility
   - VLC for MJPEG and RTSP

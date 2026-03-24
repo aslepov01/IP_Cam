@@ -36,7 +36,7 @@ These are the primary documents providing complete overview of the project:
 ### [TESTING.md](TESTING.md)
 **Testing procedures and guides:**
 - JVM unit tests for core runtime logic
-- Real-device instrumentation suite for lifecycle and streaming behavior
+- Real-device instrumentation suite for lifecycle, streaming, reconfiguration, and persistence behavior
 - `adb` execution flow and device prerequisites
 - Manual exploratory checks and compatibility validation
 - Troubleshooting guide

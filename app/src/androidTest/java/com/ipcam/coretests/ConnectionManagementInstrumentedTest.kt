@@ -4,12 +4,43 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.json.JSONArray
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.net.URLEncoder
 
 @RunWith(AndroidJUnit4::class)
 class ConnectionManagementInstrumentedTest : BaseDeviceCoreTest() {
+
+    // Verifies concurrent MJPEG streams from different client addresses: when the limit allows it,
+    // loopback and the device's non-loopback host should remain active together and clean up fully.
+    @Test
+    fun distinctAddressMjpegClientsWithinLimitRemainActiveUntilAllDisconnect() {
+        val alternateHost = env.discoverAlternateHostOrNull()
+        assumeTrue("Device did not expose a reachable non-loopback HTTP host", alternateHost != null)
+
+        env.setConnectionLimits(mjpegStreams = 4)
+
+        val first = env.openMjpegStream()
+        val second = env.openMjpegStream(alternateHost!!)
+
+        assertTrue(first.awaitFirstJpegFrame().size > 1_000)
+        assertTrue(second.awaitFirstJpegFrame().size > 1_000)
+
+        env.waitForConnectionCount("mjpeg", 2)
+        val metrics = env.waitForMetrics(description = "two MJPEG clients to remain active") {
+            it.optInt("activeHttpStreams", -1) == 2 &&
+                it.optInt("totalLongLivedConnections", -1) == 2
+        }
+        assertEquals(2, metrics.getInt("activeHttpStreams"))
+
+        second.close()
+        first.close()
+
+        env.waitForNoLongLivedConnections()
+        env.waitForCameraState("IDLE")
+        env.waitForStreamingTelemetryQuiescent()
+    }
 
     // Verifies mixed transport accounting: when SSE, MJPEG, and RTSP are active at the same time,
     // /connections must expose all three kinds and cleanup must return the app to a clean state.

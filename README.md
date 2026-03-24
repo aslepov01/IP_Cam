@@ -187,6 +187,7 @@ ANDROID_SERIAL=<device-serial> ./gradlew connectedDebugAndroidTest
 ```
 
 The automated suite includes JVM unit tests plus a real-device instrumentation suite that exercises server lifecycle, camera leasing, MJPEG, SSE, RTSP, connection eviction, and cleanup scenarios. See [Testing Guide](documentation/TESTING.md) for the full coverage map and device setup notes.
+It also covers flashlight API behavior, app-restart persistence, live camera/format reconfiguration during active streams, and service availability after the activity closes. The current device suite contains 32 instrumentation tests.
 
 ## Requirements
 

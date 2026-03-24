@@ -148,6 +148,49 @@ class SseClient(
         return observed
     }
 
+    fun awaitInitialEventPayloads(
+        requiredEvents: Set<String> = setOf("state", "metrics"),
+        timeoutMs: Long = 15_000L
+    ): Map<String, String> {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val observed = linkedMapOf<String, String>()
+        var currentEvent: String? = null
+        val currentData = StringBuilder()
+
+        fun commitCurrentEvent() {
+            val event = currentEvent ?: return
+            observed.putIfAbsent(event, currentData.toString())
+            currentEvent = null
+            currentData.setLength(0)
+        }
+
+        while (System.currentTimeMillis() < deadline && !observed.keys.containsAll(requiredEvents)) {
+            try {
+                val line = reader.readLine() ?: break
+                when {
+                    line.startsWith("event:") -> {
+                        commitCurrentEvent()
+                        currentEvent = line.removePrefix("event:").trim()
+                    }
+
+                    line.startsWith("data:") -> {
+                        if (currentData.isNotEmpty()) {
+                            currentData.append('\n')
+                        }
+                        currentData.append(line.removePrefix("data:").trimStart())
+                    }
+
+                    line.isEmpty() -> commitCurrentEvent()
+                }
+            } catch (_: SocketTimeoutException) {
+                // Keep waiting.
+            }
+        }
+
+        commitCurrentEvent()
+        return observed
+    }
+
     fun awaitDisconnected(timeoutMs: Long = 10_000L): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
 

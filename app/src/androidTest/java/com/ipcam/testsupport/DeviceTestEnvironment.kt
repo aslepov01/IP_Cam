@@ -172,6 +172,36 @@ class DeviceTestEnvironment {
         }
     }
 
+    fun waitForSelectedCamera(
+        cameraId: String,
+        timeoutMs: Long = 20_000L
+    ): JSONObject {
+        return waitUntil(timeoutMs, "selected camera to become $cameraId") {
+            val status = loopbackStatus()
+            if (status.optString("cameraId") == cameraId) status else null
+        }
+    }
+
+    fun waitForSelectedResolution(
+        resolutionLabel: String,
+        timeoutMs: Long = 20_000L
+    ): JSONObject {
+        return waitUntil(timeoutMs, "selected resolution to become $resolutionLabel") {
+            val status = loopbackStatus()
+            if (status.optString("resolution") == resolutionLabel) status else null
+        }
+    }
+
+    fun waitForFlashlightState(
+        enabled: Boolean,
+        timeoutMs: Long = 15_000L
+    ): JSONObject {
+        return waitUntil(timeoutMs, "flashlight state to become $enabled") {
+            val status = loopbackStatus()
+            if (status.optBoolean("flashlightOn") == enabled) status else null
+        }
+    }
+
     fun ensureRtspEnabled(): JSONObject {
         val status = jsonGet("/rtspStatus")
         val enabledStatus = if (status.optBoolean("rtspEnabled")) {
@@ -240,6 +270,25 @@ class DeviceTestEnvironment {
             "", "0.0.0.0", LOOPBACK_HOST, "localhost" -> null
             else -> host
         }
+    }
+
+    fun closeMainActivityKeepingServiceRunning() {
+        closeMainActivity()
+        waitForHttpServer()
+    }
+
+    fun restartAppPreservingState() {
+        closeTrackedResources()
+        closeMainActivity()
+        runCatching { appContext.stopService(cameraServiceIntent()) }
+        waitForPortClosedOrServiceStopped(8080)
+        waitForPortClosedOrServiceStopped(8554)
+
+        launchMainActivity()
+        startHttpServer()
+        ensureRuntimePermissionsGranted()
+        waitForHttpServer()
+        waitForCameraCatalogReady()
     }
 
     private fun launchMainActivity() {
