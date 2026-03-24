@@ -354,7 +354,7 @@ This document specifies the complete requirements for the IP_Cam Android applica
 #### API-2.1: RTSP Server ✅ IMPLEMENTED
 **Requirement:** RTSP server on port 8554  
 **Status:** Complete  
-**URL:** `rtsp://<device-ip>:8554/camera`
+**URL:** `rtsp://<device-ip>:8554/stream`
 
 #### API-2.2: Transport Modes ✅ IMPLEMENTED
 **Requirement:** Support UDP and TCP transport  

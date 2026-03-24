@@ -1,12 +1,10 @@
 package com.ipcam
 
-import android.annotation.SuppressLint
 import android.app.admin.DeviceAdminReceiver
 import android.app.admin.DevicePolicyManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import android.os.Build
 import android.os.UserManager
 import android.util.Log
 import android.widget.Toast
@@ -39,56 +37,6 @@ class DeviceAdminReceiver : DeviceAdminReceiver() {
 
     companion object {
         private const val TAG = "DeviceAdminReceiver"
-        
-        /**
-         * Reboot the device (requires Device Owner mode).
-         * 
-         * This function leverages Device Owner privileges to reboot the device programmatically.
-         * No manifest permission is required - Device Owner status grants elevated privileges
-         * at runtime that allow PowerManager.reboot() to succeed.
-         * 
-         * Note: android.permission.REBOOT is a system-only permission and cannot be declared
-         * in the manifest for regular apps. Device Owner mode provides the necessary privileges
-         * without requiring this protected permission.
-         * 
-         * @param context Application context
-         * @return true if reboot was initiated, false if not Device Owner
-         */
-        @SuppressLint("MissingPermission")
-        fun rebootDevice(context: Context): Boolean {
-            try {
-                val dpm = context.getSystemService(Context.DEVICE_POLICY_SERVICE) as? DevicePolicyManager
-                if (dpm == null) {
-                    Log.e(TAG, "DevicePolicyManager not available")
-                    return false
-                }
-                
-                val adminComponent = ComponentName(context, DeviceAdminReceiver::class.java)
-                
-                // Check if we're Device Owner
-                if (!dpm.isDeviceOwnerApp(context.packageName)) {
-                    Log.w(TAG, "Reboot requested but app is not Device Owner")
-                    return false
-                }
-                
-                Log.i(TAG, "Device Owner reboot initiated via API")
-                
-                // Use PowerManager to reboot the device
-                // Device Owner privileges allow this call without manifest permission
-                val powerManager = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
-                if (powerManager != null) {
-                    powerManager.reboot("IP_Cam remote reboot")
-                    return true
-                } else {
-                    Log.e(TAG, "PowerManager not available")
-                    return false
-                }
-                
-            } catch (e: Exception) {
-                Log.e(TAG, "Error rebooting device", e)
-                return false
-            }
-        }
     }
 
     /**

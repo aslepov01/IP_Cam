@@ -33,7 +33,6 @@ import android.os.IBinder
 import android.os.PowerManager
 import android.util.Log
 import android.util.Size
-import android.view.OrientationEventListener
 import android.view.Surface
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -913,8 +912,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     private var wifiLock: WifiManager.WifiLock? = null
     private var cameraOrientation: String = "landscape" // "portrait" or "landscape" - base camera recording mode
     private var rotation: Int = 0 // 0, 90, 180, 270 - applied to the camera-oriented image
-    private var deviceOrientation: Int = 0 // Current device orientation (for app UI only, not camera)
-    private var orientationEventListener: OrientationEventListener? = null
     // OSD overlay settings - individually toggleable
     private var showDateTimeOverlay: Boolean = true // Show date/time in top left
     private var showBatteryOverlay: Boolean = true // Show battery in top right
@@ -960,8 +957,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
     private lateinit var runtimeTelemetrySampler: RuntimeTelemetrySampler
     @Volatile private var latestRuntimeTelemetry: RuntimeTelemetrySnapshot = RuntimeTelemetrySnapshot.empty()
     private var telemetryJob: Job? = null
-    @Volatile private var adaptiveQualityEnabled: Boolean = false // Deprecated compatibility flag
-    
     // RTSP server for hardware-accelerated H.264 streaming
     private var rtspServer: RTSPServer? = null
     @Volatile private var rtspEnabled: Boolean = false
@@ -1203,7 +1198,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         
         acquireLocks()
         registerNetworkReceiver()
-        setupOrientationListener()
         lifecycleRegistry.currentState = Lifecycle.State.STARTED
         initializeCameraProvider {
             startCameraCatalogBootstrap("service create")
@@ -3120,9 +3114,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         targetMjpegFps = prefs.getInt("targetMjpegFps", 10).coerceIn(1, 60)
         targetRtspFps = prefs.getInt("targetRtspFps", 30).coerceIn(1, 60)
         
-        // Adaptive quality is currently removed from runtime logic.
-        adaptiveQualityEnabled = false
-
         connectionLimits = if (
             prefs.contains(PREF_MAX_MJPEG_STREAMS) ||
             prefs.contains(PREF_MAX_SSE_CLIENTS) ||
@@ -3214,7 +3205,7 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
                 "resolution=${selectedResolution?.let { "${it.width}x${it.height}" } ?: "auto"}, " +
                 "connectionLimits=$connectionLimits, desiredTorch=$desiredTorchEnabled, mjpegFps=$targetMjpegFps, " +
                 "rtspFps=$targetRtspFps, rtspBitrate=$rtspBitrate, rtspBitrateMode=$rtspBitrateMode, " +
-                "adaptiveQuality=$adaptiveQualityEnabled, deviceName=$deviceName"
+                "deviceName=$deviceName"
         )
     }
     
@@ -3234,9 +3225,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             putInt("targetMjpegFps", targetMjpegFps)
             putInt("targetRtspFps", targetRtspFps)
             
-            // Keep deprecated setting persisted as disabled for compatibility.
-            putBoolean("adaptiveQualityEnabled", false)
-
             putInt(PREF_MAX_MJPEG_STREAMS, connectionLimits.maxMjpegStreams)
             putInt(PREF_MAX_SSE_CLIENTS, connectionLimits.maxSseClients)
             putInt(PREF_MAX_RTSP_SESSIONS, connectionLimits.maxRtspSessions)
@@ -3275,17 +3263,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             
             apply()
         }
-    }
-    
-    fun onDeviceOrientationChanged() {
-        // Device orientation changes only affect the app UI, not the camera recording
-        // This method is kept for compatibility but device orientation doesn't affect camera
-    }
-    
-    private fun setupOrientationListener() {
-        // Device orientation listener is disabled since camera recording is independent of device orientation
-        // The camera orientation mode (portrait/landscape) is set manually or stays at default (landscape)
-        orientationEventListener = null
     }
     
     fun registerActivityCallbacks(
@@ -3639,7 +3616,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
         
         unregisterNetworkReceiver()
         unregisterBatteryReceiver()
-        orientationEventListener?.disable()
         httpServer?.stop()
         wifiDebuggingManager?.stopMonitoring()
         detachCameraStateObserver()
@@ -4447,7 +4423,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
             "maxMjpegStreams" to limits.maxMjpegStreams,
             "maxSseClients" to limits.maxSseClients,
             "maxRtspSessions" to limits.maxRtspSessions,
-            "adaptiveQualityEnabled" to false,
             "flashlightAvailable" to isFlashlightAvailable(),
             "flashlightOn" to isFlashlightEnabled(),
             "batteryMode" to batteryMode.name,
@@ -4545,12 +4520,6 @@ class CameraService : Service(), LifecycleOwner, CameraServiceInterface {
 
     override fun getRuntimeTelemetrySnapshot(): RuntimeTelemetrySnapshot {
         return latestRuntimeTelemetry
-    }
-    
-    override fun setAdaptiveQualityEnabled(enabled: Boolean) {
-        adaptiveQualityEnabled = false
-        saveSettings()
-        Log.w(TAG, "Adaptive quality toggle ignored - feature is deprecated")
     }
     
     // ==================== RTSP Streaming Control ====================

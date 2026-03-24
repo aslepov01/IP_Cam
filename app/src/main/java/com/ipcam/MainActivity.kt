@@ -1553,12 +1553,6 @@ class MainActivity : AppCompatActivity() {
         releaseServiceBinding("onStop")
     }
     
-    override fun onConfigurationChanged(newConfig: android.content.res.Configuration) {
-        super.onConfigurationChanged(newConfig)
-        // Configuration changes (like rotation) are automatically handled by OrientationEventListener
-        // in the CameraService, so no action needed here
-    }
-    
     // Helper method to setup collapsible sections
     private fun setupCollapsibleSection(
         header: View,

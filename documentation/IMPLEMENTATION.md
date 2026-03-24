@@ -132,8 +132,8 @@ streamingExecutor.execute {
 
 **Usage:**
 ```bash
-vlc rtsp://<device-ip>:8554/camera
-ffplay rtsp://<device-ip>:8554/camera
+vlc rtsp://<device-ip>:8554/stream
+ffplay rtsp://<device-ip>:8554/stream
 ```
 
 ### Dual-Stream Architecture
@@ -381,7 +381,7 @@ call.respondTextWriter(ContentType.Text.EventStream) {
 **Monitoring:**
 - Real-time bandwidth calculation
 - Per-client tracking
-- Adaptive quality (planned)
+- Unified runtime telemetry for CPU, bandwidth, FPS, battery, and connection counts
 
 ### Image Processing
 

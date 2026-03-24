@@ -67,6 +67,7 @@ class HttpServer(
         val remoteAddr: String,
         val startTime: Long,
         val channel: ByteWriteChannel,
+        val writeLock: Any = Any(),
         @Volatile var active: Boolean = true,
         @Volatile var responseJob: Job? = null
     )
@@ -177,10 +178,6 @@ class HttpServer(
                 // Server configuration
                 get("/setConnectionLimits") { serveSetConnectionLimits() }
                 get("/restart") { serveRestartServer() }
-                
-                // Adaptive quality control
-                get("/enableAdaptiveQuality") { serveEnableAdaptiveQuality() }
-                get("/disableAdaptiveQuality") { serveDisableAdaptiveQuality() }
                 
                 // RTSP streaming endpoints
                 get("/enableRTSP") { serveEnableRTSP() }
@@ -417,6 +414,21 @@ class HttpServer(
         return true
     }
 
+    private fun writeSseMessage(
+        client: SSEClient,
+        message: String,
+        timeoutMs: Long = 500L
+    ) {
+        synchronized(client.writeLock) {
+            runBlocking {
+                withTimeout(timeoutMs) {
+                    client.channel.writeStringUtf8(message)
+                    client.channel.flush()
+                }
+            }
+        }
+    }
+
     private fun broadcastSseMessage(message: String) {
         var removedClient = false
         synchronized(sseClientsLock) {
@@ -425,12 +437,7 @@ class HttpServer(
                 val client = iterator.next()
                 if (client.active) {
                     try {
-                        runBlocking {
-                            withTimeout(500) {
-                                client.channel.writeStringUtf8(message)
-                                client.channel.flush()
-                            }
-                        }
+                        writeSseMessage(client, message)
                     } catch (e: TimeoutCancellationException) {
                         Log.d(TAG, "SSE client ${client.id} write timeout")
                         terminateSseClient(client, "SSE write timeout")
@@ -981,12 +988,10 @@ class HttpServer(
             try {
                 // Send initial camera state (full state for new clients)
                 val stateJson = cameraService.getCameraStateJson()
-                writeStringUtf8("event: state\ndata: $stateJson\n\n")
-                flush()
+                writeSseMessage(client, "event: state\ndata: $stateJson\n\n", timeoutMs = 2_000L)
 
                 val metricsJson = cameraService.getRuntimeTelemetrySnapshot().toJson()
-                writeStringUtf8("event: metrics\ndata: $metricsJson\n\n")
-                flush()
+                writeSseMessage(client, "event: metrics\ndata: $metricsJson\n\n", timeoutMs = 2_000L)
                 
                 // Initialize last broadcast state with current values to prevent
                 // full state from being sent again on next delta broadcast
@@ -995,8 +1000,7 @@ class HttpServer(
                 // Keep connection alive with periodic keepalive
                 while (client.active && isActive) {
                     delay(30000)
-                    writeStringUtf8(": keepalive\n\n")
-                    flush()
+                    writeSseMessage(client, ": keepalive\n\n")
                 }
             } catch (e: Exception) {
                 Log.d(TAG, "SSE client $clientId disconnected: ${e.message}")
@@ -1446,20 +1450,6 @@ class HttpServer(
     private suspend fun PipelineContext<Unit, ApplicationCall>.serveDetailedStats() {
         val stats = cameraService.getDetailedStats()
         call.respondText(stats, ContentType.Text.Plain)
-    }
-    
-    private suspend fun PipelineContext<Unit, ApplicationCall>.serveEnableAdaptiveQuality() {
-        call.respondText(
-            """{"status":"deprecated","message":"Adaptive quality has been removed","adaptiveQualityEnabled":false}""",
-            ContentType.Application.Json
-        )
-    }
-    
-    private suspend fun PipelineContext<Unit, ApplicationCall>.serveDisableAdaptiveQuality() {
-        call.respondText(
-            """{"status":"deprecated","message":"Adaptive quality has been removed","adaptiveQualityEnabled":false}""",
-            ContentType.Application.Json
-        )
     }
     
     // ==================== RTSP Streaming Endpoints ====================

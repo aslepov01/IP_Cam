@@ -43,7 +43,7 @@ IP_Cam transforms your Android phone or tablet into a fully-featured IP camera a
 | `GET /resetCamera` | Reset camera service (recovery from frozen states) |
 | `GET /checkUpdate` | Check for app updates |
 | `GET /triggerUpdate` | Download and install update |
-| `rtsp://<ip>:8554/camera` | RTSP/H.264 stream |
+| `rtsp://<ip>:8554/stream` | RTSP/H.264 stream |
 
 **Example:**
 ```bash
@@ -52,7 +52,7 @@ curl http://192.168.1.100:8080/snapshot -o photo.jpg
 
 # View stream in VLC
 vlc http://192.168.1.100:8080/stream
-vlc rtsp://192.168.1.100:8554/camera
+vlc rtsp://192.168.1.100:8554/stream
 
 # Check for app updates
 curl http://192.168.1.100:8080/checkUpdate
@@ -163,7 +163,7 @@ Comprehensive documentation is available in the [`/documentation`](documentation
 ### Prerequisites
 - Android Studio (Arctic Fox or later)
 - Android SDK (API 34)
-- JDK 8+
+- JDK 17+ (or the bundled JBR from Android Studio)
 
 ### Build Steps
 ```bash
