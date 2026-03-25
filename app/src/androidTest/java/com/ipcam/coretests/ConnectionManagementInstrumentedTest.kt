@@ -2,6 +2,7 @@ package com.ipcam.coretests
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -153,6 +154,73 @@ class ConnectionManagementInstrumentedTest : BaseDeviceCoreTest() {
 
         env.waitForNoLongLivedConnections()
         env.waitForCameraState("IDLE")
+    }
+
+    // Verifies that /connections exposes full metadata (endpoint, active, state, duration) for each
+    // transport kind, and that RTSP sessions transition through READY and PLAYING states.
+    @Test
+    fun connectionSnapshotsExposeMetadataAndRtspStateTransitions() {
+        env.ensureRtspEnabled()
+
+        val sse = env.openSse()
+        sse.awaitInitialEvents()
+
+        val mjpeg = env.openMjpegStream()
+        mjpeg.awaitFirstJpegFrame()
+
+        val rtsp = env.openRtspTcp()
+        rtsp.describe()
+        rtsp.setupTcp()
+
+        // After SETUP the RTSP session should be in READY state
+        val readyConnections = env.waitForConnectionCount("rtsp", 1)
+        val rtspReady = findConnectionOfKind(readyConnections, "rtsp")
+        assertEquals("/events", findConnectionOfKind(env.connectionSnapshots(), "sse").getString("endpoint"))
+        assertEquals("/stream", findConnectionOfKind(env.connectionSnapshots(), "mjpeg").getString("endpoint"))
+        assertTrue(rtspReady.getString("endpoint").contains("rtsp://"))
+        assertEquals("READY", rtspReady.getString("state"))
+        assertTrue(rtspReady.getBoolean("active"))
+        assertTrue("Duration should be non-negative", rtspReady.getLong("duration") >= 0)
+
+        // After PLAY the RTSP session should transition to PLAYING
+        rtsp.play()
+        rtsp.awaitInterleavedRtpPacket()
+        env.waitForRtspPlayingSessions(1)
+
+        val playingConnections = env.connectionSnapshots()
+        val rtspPlaying = findConnectionOfKind(playingConnections, "rtsp")
+        assertEquals("PLAYING", rtspPlaying.getString("state"))
+        assertTrue(rtspPlaying.getBoolean("active"))
+
+        // Verify MJPEG and SSE metadata
+        val mjpegConn = findConnectionOfKind(playingConnections, "mjpeg")
+        assertEquals("/stream", mjpegConn.getString("endpoint"))
+        assertTrue(mjpegConn.getBoolean("active"))
+        assertTrue(mjpegConn.has("state"))
+
+        val sseConn = findConnectionOfKind(playingConnections, "sse")
+        assertEquals("/events", sseConn.getString("endpoint"))
+        assertTrue(sseConn.getBoolean("active"))
+        assertEquals("CONNECTED", sseConn.getString("state"))
+
+        rtsp.teardown()
+        rtsp.close()
+        mjpeg.close()
+        sse.close()
+
+        env.waitForRtspPlayingSessions(0)
+        env.waitForNoLongLivedConnections()
+        env.waitForCameraState("IDLE")
+    }
+
+    private fun findConnectionOfKind(connections: JSONArray, kind: String): JSONObject {
+        for (index in 0 until connections.length()) {
+            val connection = connections.getJSONObject(index)
+            if (connection.getString("kind") == kind) {
+                return connection
+            }
+        }
+        throw AssertionError("No $kind connection found in /connections")
     }
 
     private fun hasConnectionKind(connections: JSONArray, kind: String): Boolean {

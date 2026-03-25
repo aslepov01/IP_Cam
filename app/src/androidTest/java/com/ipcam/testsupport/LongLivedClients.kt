@@ -3,11 +3,9 @@ package com.ipcam.testsupport
 import org.json.JSONObject
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
-import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.IOException
-import java.io.InputStreamReader
 import java.net.ConnectException
 import java.net.InetSocketAddress
 import java.net.Socket
@@ -131,7 +129,8 @@ class SseClient(
         readTimeoutMs = 2_000,
         keepAlive = true
     )
-    private val reader = BufferedReader(InputStreamReader(connection.input))
+    private val input = connection.input
+    private val lineAccumulator = ByteArrayOutputStream()
 
     val statusCode: Int = connection.statusCode
     val contentType: String = connection.headerValue("Content-Type").orEmpty()
@@ -145,7 +144,7 @@ class SseClient(
 
         while (System.currentTimeMillis() < deadline && !observed.containsAll(requiredEvents)) {
             try {
-                val line = reader.readLine() ?: break
+                val line = readSseLine() ?: break
                 if (line.startsWith("event:")) {
                     observed += line.removePrefix("event:").trim()
                 }
@@ -175,7 +174,7 @@ class SseClient(
 
         while (System.currentTimeMillis() < deadline && !observed.keys.containsAll(requiredEvents)) {
             try {
-                val line = reader.readLine() ?: break
+                val line = readSseLine() ?: break
                 when {
                     line.startsWith("event:") -> {
                         commitCurrentEvent()
@@ -200,12 +199,47 @@ class SseClient(
         return observed
     }
 
+    fun awaitEventOfType(
+        eventType: String,
+        timeoutMs: Long = 10_000L
+    ): String? {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        var currentEvent: String? = null
+        val currentData = StringBuilder()
+
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                val line = readSseLine() ?: return null
+                when {
+                    line.startsWith("event:") -> {
+                        currentEvent = line.removePrefix("event:").trim()
+                        currentData.setLength(0)
+                    }
+                    line.startsWith("data:") -> {
+                        if (currentData.isNotEmpty()) currentData.append('\n')
+                        currentData.append(line.removePrefix("data:").trimStart())
+                    }
+                    line.isEmpty() -> {
+                        if (currentEvent == eventType && currentData.isNotEmpty()) {
+                            return currentData.toString()
+                        }
+                        currentEvent = null
+                        currentData.setLength(0)
+                    }
+                }
+            } catch (_: SocketTimeoutException) {
+                // Keep waiting.
+            }
+        }
+        return null
+    }
+
     fun awaitDisconnected(timeoutMs: Long = 10_000L): Boolean {
         val deadline = System.currentTimeMillis() + timeoutMs
 
         while (System.currentTimeMillis() < deadline) {
             try {
-                val line = reader.readLine()
+                val line = readSseLine()
                 if (line == null) {
                     return true
                 }
@@ -221,6 +255,32 @@ class SseClient(
 
     override fun close() {
         connection.close()
+    }
+
+    /**
+     * Reads a single line from the SSE stream, preserving partial data across
+     * SocketTimeoutExceptions. Unlike BufferedReader.readLine(), this method keeps
+     * bytes accumulated before a timeout so they are not lost on retry.
+     */
+    private fun readSseLine(): String? {
+        while (true) {
+            val b = input.read()
+            if (b == -1) {
+                return if (lineAccumulator.size() > 0) flushLine() else null
+            }
+            if (b == '\n'.code) {
+                return flushLine()
+            }
+            if (b != '\r'.code) {
+                lineAccumulator.write(b)
+            }
+        }
+    }
+
+    private fun flushLine(): String {
+        val result = lineAccumulator.toByteArray().toString(Charsets.UTF_8)
+        lineAccumulator.reset()
+        return result
     }
 }
 

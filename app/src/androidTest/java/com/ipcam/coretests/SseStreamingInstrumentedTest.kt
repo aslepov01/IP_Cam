@@ -2,7 +2,10 @@ package com.ipcam.coretests
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.json.JSONArray
+import org.json.JSONObject
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -92,6 +95,111 @@ class SseStreamingInstrumentedTest : BaseDeviceCoreTest() {
         env.waitForConnectionAbsent(sseConnectionId)
 
         env.waitForNoLongLivedConnections()
+    }
+
+    // Verifies SSE state deltas after configuration changes: /setRotation and /setCameraOrientation
+    // must produce delta events with only the changed fields, and setting the same value twice
+    // must not emit a redundant delta.
+    @Test
+    fun sseStateDeltasReflectConfigurationChangesWithoutRedundancy() {
+        val sse = env.openSse()
+        sse.awaitInitialEventPayloads()
+
+        env.jsonGet("/setRotation?value=90")
+        val rotationDelta = sse.awaitEventOfType("state", timeoutMs = 10_000L)
+        assertNotNull("Expected SSE state delta after /setRotation", rotationDelta)
+        val rotationJson = JSONObject(rotationDelta!!)
+        assertEquals(90, rotationJson.getInt("rotation"))
+
+        env.jsonGet("/setCameraOrientation?value=portrait")
+        val orientationDelta = sse.awaitEventOfType("state", timeoutMs = 10_000L)
+        assertNotNull("Expected SSE state delta after /setCameraOrientation", orientationDelta)
+        val orientationJson = JSONObject(orientationDelta!!)
+        assertEquals("portrait", orientationJson.getString("cameraOrientation"))
+
+        // Setting the same rotation again should not produce a redundant delta.
+        // Verify by setting the same value, then changing a different field:
+        // the next delta must contain the new field but NOT the unchanged rotation.
+        env.jsonGet("/setRotation?value=90")
+        env.jsonGet("/setCameraOrientation?value=landscape")
+        val nextDelta = sse.awaitEventOfType("state", timeoutMs = 10_000L)
+        assertNotNull("Expected SSE state delta after /setCameraOrientation reset", nextDelta)
+        val nextJson = JSONObject(nextDelta!!)
+        assertEquals("landscape", nextJson.getString("cameraOrientation"))
+        assertFalse("Redundant rotation should not appear in delta", nextJson.has("rotation"))
+
+        // Restore defaults
+        env.jsonGet("/setRotation?value=0")
+
+        sse.close()
+        env.waitForNoLongLivedConnections()
+    }
+
+    // Verifies that SSE metrics events reflect connection churn: opening and closing MJPEG and
+    // RTSP clients must cause subsequent metrics events to report the updated connection counts.
+    @Test
+    fun sseMetricsEventsReflectConnectionChurn() {
+        env.ensureRtspEnabled()
+
+        val sse = env.openSse()
+        sse.awaitInitialEventPayloads()
+
+        val mjpeg = env.openMjpegStream()
+        mjpeg.awaitFirstJpegFrame()
+
+        val metricsWithMjpeg = awaitSseMetricsMatching(sse) {
+            it.optInt("activeHttpStreams", -1) >= 1
+        }
+        assertTrue(metricsWithMjpeg.getInt("activeHttpStreams") >= 1)
+
+        val rtsp = env.openRtspTcp()
+        rtsp.describe()
+        rtsp.setupTcp()
+        rtsp.play()
+        rtsp.awaitInterleavedRtpPacket()
+
+        val metricsWithBoth = awaitSseMetricsMatching(sse) {
+            it.optInt("activeHttpStreams", -1) >= 1 &&
+                it.optInt("rtspPlayingSessions", -1) >= 1
+        }
+        assertTrue(metricsWithBoth.getInt("activeHttpStreams") >= 1)
+        assertTrue(metricsWithBoth.getInt("rtspPlayingSessions") >= 1)
+
+        rtsp.teardown()
+        rtsp.close()
+        mjpeg.close()
+
+        val idleMetrics = awaitSseMetricsMatching(sse) {
+            it.optInt("activeHttpStreams", -1) == 0 &&
+                it.optInt("activeRtspConnections", -1) == 0 &&
+                it.optInt("rtspPlayingSessions", -1) == 0 &&
+                it.optInt("totalCameraClients", -1) == 0
+        }
+        assertEquals(0, idleMetrics.getInt("activeHttpStreams"))
+        assertEquals(0, idleMetrics.getInt("totalCameraClients"))
+
+        sse.close()
+        env.waitForNoLongLivedConnections()
+        env.waitForCameraState("IDLE")
+    }
+
+    private fun awaitSseMetricsMatching(
+        sse: com.ipcam.testsupport.SseClient,
+        timeoutMs: Long = 20_000L,
+        predicate: (JSONObject) -> Boolean
+    ): JSONObject {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val payload = sse.awaitEventOfType("metrics", timeoutMs = 5_000L) ?: continue
+            val json = try {
+                JSONObject(payload)
+            } catch (_: org.json.JSONException) {
+                // Server may truncate SSE messages under heavy write pressure; skip and retry.
+                continue
+            }
+            if (predicate(json)) return json
+        }
+        throw AssertionError("Timed out waiting for matching SSE metrics event")
     }
 
     private fun findFirstConnectionId(kind: String): String {
