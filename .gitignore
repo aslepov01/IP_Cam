@@ -97,3 +97,12 @@ lint/tmp/
 /.idea/deviceManager.xml
 /app/release/
 /release.keystore
+
+# macOS
+.DS_Store
+
+# Codex / temporary tooling
+.codex-temp/
+
+# IntelliJ code style (local)
+.idea/codeStyles/
