@@ -213,6 +213,31 @@ class ConnectionManagementInstrumentedTest : BaseDeviceCoreTest() {
         env.waitForCameraState("IDLE")
     }
 
+    // Verifies `/closeConnection` tears down a playing RTSP session: socket disconnects, RTSP
+    // counters return to zero, and the camera pipeline returns to IDLE when it was the last consumer.
+    @Test
+    fun closeConnectionEndpointTerminatesPlayingRtspSessionAndReleasesCamera() {
+        env.ensureRtspEnabled()
+
+        val rtsp = env.openRtspTcp()
+        rtsp.describe()
+        rtsp.setupTcp()
+        rtsp.play()
+        rtsp.awaitInterleavedRtpPacket()
+        env.waitForRtspPlayingSessions(1)
+        env.waitForCameraState("ACTIVE")
+
+        val connectionId = findFirstConnectionId("rtsp")
+        val response = env.jsonGet("/closeConnection?id=${URLEncoder.encode(connectionId, "UTF-8")}")
+        assertEquals("ok", response.getString("status"))
+
+        assertTrue(rtsp.awaitDisconnected(timeoutMs = 15_000L))
+        env.waitForConnectionAbsent(connectionId)
+        env.waitForRtspPlayingSessions(0)
+        env.waitForNoLongLivedConnections()
+        env.waitForCameraState("IDLE")
+    }
+
     private fun findConnectionOfKind(connections: JSONArray, kind: String): JSONObject {
         for (index in 0 until connections.length()) {
             val connection = connections.getJSONObject(index)

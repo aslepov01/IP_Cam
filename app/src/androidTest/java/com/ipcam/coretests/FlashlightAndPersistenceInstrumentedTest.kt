@@ -110,6 +110,90 @@ class FlashlightAndPersistenceInstrumentedTest : BaseDeviceCoreTest() {
         env.waitForCameraState("IDLE")
     }
 
+    // Verifies OSD overlay persistence across a full app restart: the four overlay endpoints set a
+    // known pattern, then `restartAppPreservingState` runs; after restart the initial SSE `state`
+    // event must match. If `/status` ever exposes the same overlay keys, they are asserted too.
+    @Test
+    fun overlaySettingsPersistAcrossAppRestart() {
+        env.jsonGet("/setDateTimeOverlay?value=true")
+        env.jsonGet("/setBatteryOverlay?value=false")
+        env.jsonGet("/setResolutionOverlay?value=true")
+        env.jsonGet("/setFpsOverlay?value=false")
+
+        env.restartAppPreservingState()
+
+        val status = env.loopbackStatus()
+        if (status.has("showResolutionOverlay")) {
+            assertEquals(true, status.getBoolean("showDateTimeOverlay"))
+            assertEquals(false, status.getBoolean("showBatteryOverlay"))
+            assertEquals(true, status.getBoolean("showResolutionOverlay"))
+            assertEquals(false, status.getBoolean("showFpsOverlay"))
+        }
+
+        val sse = env.openSse()
+        val payloads = sse.awaitInitialEventPayloads()
+        val state = JSONObject(payloads["state"] ?: throw AssertionError("Missing initial SSE state"))
+        assertEquals(true, state.getBoolean("showDateTimeOverlay"))
+        assertEquals(false, state.getBoolean("showBatteryOverlay"))
+        assertEquals(true, state.getBoolean("showResolutionOverlay"))
+        assertEquals(false, state.getBoolean("showFpsOverlay"))
+
+        sse.close()
+        env.waitForNoLongLivedConnections()
+        env.waitForCameraState("IDLE")
+
+        env.jsonGet("/setDateTimeOverlay?value=false")
+        env.jsonGet("/setBatteryOverlay?value=false")
+        env.jsonGet("/setResolutionOverlay?value=false")
+        env.jsonGet("/setFpsOverlay?value=false")
+    }
+
+    // Verifies persistence across a full app restart for connection limits, MJPEG/RTSP target FPS
+    // (observed in the initial SSE `state`), RTSP bitrate and mode (checked via `/rtspStatus` after
+    // re-enabling RTSP), and default `deviceName` in `/status` (`IP_CAM_<model>`). Bitrate is set
+    // in Mbps as required by `/setRTSPBitrate`.
+    @Test
+    fun connectionLimitsFpsRtspBitrateAndDeviceNamePersistAcrossAppRestart() {
+        env.setConnectionLimits(mjpegStreams = 5, sseClients = 3, rtspSessions = 2)
+        env.jsonGet("/setMjpegFps?value=15")
+        env.jsonGet("/setRtspFps?value=20")
+        env.jsonGet("/setRTSPBitrate?value=4")
+        env.jsonGet("/setRTSPBitrateMode?value=CBR")
+
+        val expectedDeviceName = "IP_CAM_${android.os.Build.MODEL.replace(" ", "_")}"
+
+        env.restartAppPreservingState()
+
+        val status = env.loopbackStatus()
+        val limits = status.getJSONObject("connectionLimits")
+        assertEquals(5, limits.getInt("maxMjpegStreams"))
+        assertEquals(3, limits.getInt("maxSseClients"))
+        assertEquals(2, limits.getInt("maxRtspSessions"))
+        assertTrue(status.getString("deviceName").isNotEmpty())
+        assertEquals(expectedDeviceName, status.getString("deviceName"))
+
+        val sse = env.openSse()
+        val state = JSONObject(
+            sse.awaitInitialEventPayloads()["state"]
+                ?: throw AssertionError("Missing SSE state after restart")
+        )
+        assertEquals(15, state.getInt("targetMjpegFps"))
+        assertEquals(20, state.getInt("targetRtspFps"))
+        assertEquals(5, state.getInt("maxMjpegStreams"))
+        assertEquals(3, state.getInt("maxSseClients"))
+        assertEquals(2, state.getInt("maxRtspSessions"))
+        sse.close()
+        env.waitForNoLongLivedConnections()
+
+        env.ensureRtspEnabled()
+        val rtspStatus = env.jsonGet("/rtspStatus")
+        assertEquals(4.0, rtspStatus.getDouble("bitrateMbps"), 0.05)
+        assertEquals("CBR", rtspStatus.getString("bitrateMode"))
+
+        runCatching { env.jsonGet("/disableRTSP", expectedCode = null) }
+        env.waitForCameraState("IDLE")
+    }
+
     private fun findCameraIdByFlashSupport(cameras: JSONArray, hasFlash: Boolean): String? {
         for (index in 0 until cameras.length()) {
             val camera = cameras.getJSONObject(index)

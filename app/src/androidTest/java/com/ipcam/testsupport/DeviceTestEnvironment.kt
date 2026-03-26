@@ -240,6 +240,19 @@ class DeviceTestEnvironment {
 
     fun loopbackStatus(): JSONObject = jsonGet("/status")
 
+    /** Loopback HTTP server port (8080) is accepting connections. */
+    fun isLoopbackHttpServerReachable(): Boolean = isPortOpen(8080)
+
+    /**
+     * Grants CAMERA and POST_NOTIFICATIONS (API 33+) without launching MainActivity.
+     * Used when exercising components such as [com.ipcam.BootReceiver] in isolation.
+     */
+    fun grantRuntimePermissionsWithoutActivity() {
+        requiredRuntimePermissions().forEach { permission ->
+            attemptRuntimePermissionGrant(permission)
+        }
+    }
+
     fun metrics(): JSONObject = jsonGet("/metrics")
 
     fun waitForMetrics(
@@ -304,6 +317,7 @@ class DeviceTestEnvironment {
 
     fun restartAppPreservingState() {
         closeTrackedResources()
+        runCatching { jsonGet("/disableRTSP", expectedCode = null) }
         closeMainActivity()
         runCatching { appContext.stopService(cameraServiceIntent()) }
         waitForPortClosedOrServiceStopped(8080)
@@ -639,6 +653,12 @@ class DeviceTestEnvironment {
     private fun isCameraServiceRunning(): Boolean {
         return runShell("dumpsys activity services com.ipcam/.CameraService").contains("ServiceRecord")
     }
+
+    /**
+     * Runs a shell command as the instrumented test UID (typically `adb shell` equivalent).
+     * Used for battery simulation and other device-side hooks in instrumented tests.
+     */
+    fun executeShellCommand(command: String): String = runShell(command)
 
     private fun runShell(command: String): String {
         val fileDescriptor = instrumentation.uiAutomation.executeShellCommand(command)
