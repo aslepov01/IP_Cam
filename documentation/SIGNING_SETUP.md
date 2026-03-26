@@ -83,7 +83,7 @@ Go to your repository on GitHub:
 
 ### Step 5: Verify Workflow
 
-The workflow (`.github/workflows/release.yml`) is already configured. It will:
+The workflow (`.github/workflows/version-and-release.yml`) is already configured. It will:
 
 1. **Trigger** on pushes to `main` branch (when PRs are merged)
 2. **Build** the release APK with `./gradlew assembleRelease`

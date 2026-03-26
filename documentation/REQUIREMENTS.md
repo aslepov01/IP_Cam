@@ -16,7 +16,7 @@
 This document specifies the complete requirements for the IP_Cam Android application, which transforms Android devices into IP cameras for surveillance and monitoring applications.
 
 **Version:** 1.0  
-**Target Platform:** Android 11+ (API Level 30+)  
+**Target Platform:** Android 11+ (API Level 30+); `compileSdk` 35, `targetSdk` 33  
 **Primary Use Case:** Local network IP camera with surveillance system integration
 
 ---
@@ -43,7 +43,7 @@ This document specifies the complete requirements for the IP_Cam Android applica
 #### FR-1.4: Flashlight Control ✅ IMPLEMENTED
 **Requirement:** Toggle flashlight for the selected camera when torch hardware is available
 **Status:** Complete
-**Implementation:** In-app button and HTTP API (`/toggleFlashlight`)
+**Implementation:** In-app button and HTTP API (`/toggleFlashlight`, `/flashOn`, `/flashOff`)
 
 #### FR-1.5: Rotation Control ✅ IMPLEMENTED
 **Requirement:** Support 0°, 90°, 180°, 270° rotation and auto-rotation  
@@ -115,13 +115,13 @@ This document specifies the complete requirements for the IP_Cam Android applica
 
 #### FR-5.2: Server Port Configuration ⚠️ PARTIALLY IMPLEMENTED
 **Requirement:** Allow user to configure HTTP server port  
-**Status:** Hardcoded to 8080  
-**Note:** Configuration exists in code but no UI to change it
+**Status:** Default listen port is defined in code (`CameraService` uses `PORT = 8080` as the preferred port; binding may advance to the next free port if 8080 is busy). There is no in-app settings UI to change the port without modifying source.  
+**Note:** Change the `PORT` constant (or equivalent wiring) in code to use a different default.
 
-#### FR-5.3: Auto-Start on Boot ⚠️ PARTIALLY IMPLEMENTED
+#### FR-5.3: Auto-Start on Boot ✅ IMPLEMENTED
 **Requirement:** Optionally start camera service on device boot  
-**Status:** BootReceiver exists but requires user configuration  
-**Note:** Not exposed in UI settings
+**Status:** Complete  
+**Implementation:** `BootReceiver` handles `BOOT_COMPLETED`; `autoStartServer` in SharedPreferences defaults to `true` so the service starts on boot unless the user disables it. The main activity exposes an auto-start checkbox tied to the same preference.
 
 ---
 
@@ -204,8 +204,9 @@ This document specifies the complete requirements for the IP_Cam Android applica
 #### NFR-3.3: Android Version Support ✅ IMPLEMENTED
 **Requirement:** Support Android 11+ (API 30+)  
 **Status:** Complete  
-**Target:** API 34 (Android 14)  
-**Minimum:** API 30 (Android 11)
+**Minimum:** API 30 (Android 11)  
+**Target:** API 33  
+**Compile:** API 35
 
 ### NFR-4: Usability
 
@@ -222,7 +223,7 @@ This document specifies the complete requirements for the IP_Cam Android applica
 **Requirement:** Graceful error handling with informative messages  
 **Status:** Complete  
 **Implementation:**
-- JSON error responses
+- JSON or plain-text error payloads where applicable
 - User-friendly error messages
 - Automatic retry for recoverable errors
 
@@ -244,7 +245,7 @@ This document specifies the complete requirements for the IP_Cam Android applica
 #### TR-1.1: CameraX Integration ✅ IMPLEMENTED
 **Requirement:** Use CameraX for camera management  
 **Status:** Complete  
-**Version:** androidx.camera 1.3.1
+**Version:** androidx.camera 1.4.1
 
 #### TR-1.2: Single Camera Binding ✅ IMPLEMENTED
 **Requirement:** One camera binding serves all consumers  
@@ -256,7 +257,7 @@ This document specifies the complete requirements for the IP_Cam Android applica
 #### TR-2.1: Ktor Framework ✅ IMPLEMENTED
 **Requirement:** Use Ktor for HTTP server implementation  
 **Status:** Complete  
-**Version:** Ktor 2.3.7
+**Version:** Ktor 2.3.12
 
 #### TR-2.2: Server-Sent Events ✅ IMPLEMENTED
 **Requirement:** SSE support for real-time updates  
@@ -291,7 +292,7 @@ This document specifies the complete requirements for the IP_Cam Android applica
 #### TR-4.2: Coroutines ✅ IMPLEMENTED
 **Requirement:** Kotlin coroutines for async operations  
 **Status:** Complete  
-**Version:** kotlinx.coroutines 1.7.3
+**Version:** kotlinx.coroutines 1.9.0
 
 ### TR-5: Lifecycle Management
 
@@ -305,6 +306,18 @@ This document specifies the complete requirements for the IP_Cam Android applica
 **Status:** Complete  
 **Implementation:** Explicit registration/unregistration tied to lifecycle
 
+#### TR-5.3: AndroidX Lifecycle ✅ IMPLEMENTED
+**Requirement:** Use AndroidX Lifecycle libraries where applicable  
+**Status:** Complete  
+**Version:** 2.8.7
+
+### TR-6: Language & Toolchain
+
+#### TR-6.1: Kotlin ✅ IMPLEMENTED
+**Requirement:** Kotlin language and Android Gradle plugin alignment  
+**Status:** Complete  
+**Version:** Kotlin 2.1.0
+
 ---
 
 ## API Requirements
@@ -312,37 +325,63 @@ This document specifies the complete requirements for the IP_Cam Android applica
 ### API-1: HTTP Endpoints
 
 #### API-1.1: Core Endpoints ✅ IMPLEMENTED
-**Requirement:** RESTful API for camera control and status  
+**Requirement:** HTTP API for camera control, diagnostics, static web assets, and status  
 **Status:** Complete
 
-**Implemented Endpoints:**
+**Implemented routes** (all registered as `GET` in `HttpServer.kt`):
 
-| Endpoint | Method | Purpose | Status |
-|----------|--------|---------|--------|
-| `/` | GET | Web interface | ✅ |
-| `/stream` | GET | MJPEG video stream | ✅ |
-| `/snapshot` | GET | Single JPEG frame | ✅ |
-| `/status` | GET | JSON status | ✅ |
-| `/events` | GET | SSE real-time updates | ✅ |
-| `/cameras` | GET | List available cameras | ✅ |
-| `/selectCamera` | GET | Select a specific camera by `cameraId` | ✅ |
-| `/toggleFlashlight` | GET | Toggle flashlight | ✅ |
-| `/setRotation` | GET | Set rotation | ✅ |
-| `/setFormat` | GET | Set resolution | ✅ |
-| `/restart` | GET | Restart server | ✅ |
-| `/version` | GET | Version info | ✅ |
+| Endpoint | Purpose |
+|----------|---------|
+| `/` | Web interface (index) |
+| `/index.html` | Web interface (alias) |
+| `/styles.css` | Static stylesheet |
+| `/script.js` | Static script |
+| `/snapshot` | Single JPEG frame |
+| `/stream` | MJPEG video stream (`multipart/x-mixed-replace`) |
+| `/cameras` | List available cameras |
+| `/selectCamera` | Select camera by `cameraId` query parameter |
+| `/toggleFlashlight` | Toggle torch |
+| `/flashOn` | Turn torch on |
+| `/flashOff` | Turn torch off |
+| `/status` | JSON status summary |
+| `/metrics` | JSON metrics |
+| `/events` | SSE real-time updates |
+| `/connections` | Active connection listing |
+| `/closeConnection` | Close a connection (query parameters per handler) |
+| `/stats` | Detailed statistics JSON |
+| `/formats` | Supported capture formats / resolutions |
+| `/setFormat` | Set resolution / format |
+| `/setCameraOrientation` | Set camera orientation |
+| `/setRotation` | Set rotation |
+| `/setResolutionOverlay` | Toggle resolution overlay |
+| `/setDateTimeOverlay` | Toggle date/time overlay |
+| `/setBatteryOverlay` | Toggle battery overlay |
+| `/setFpsOverlay` | Toggle FPS overlay |
+| `/setMjpegFps` | Set MJPEG target FPS |
+| `/setRtspFps` | Set RTSP target FPS |
+| `/setConnectionLimits` | Adjust connection limits |
+| `/restart` | Restart HTTP server |
+| `/enableRTSP` | Enable RTSP streaming |
+| `/disableRTSP` | Disable RTSP streaming |
+| `/rtspStatus` | RTSP status JSON |
+| `/setRTSPBitrate` | Set RTSP bitrate |
+| `/setRTSPBitrateMode` | Set RTSP bitrate mode |
+| `/overrideBatteryLimit` | Override battery-related streaming limits |
+| `/cameraState` | Camera state JSON |
+| `/activateCamera` | Activate camera pipeline |
+| `/deactivateCamera` | Deactivate camera pipeline |
+| `/resetCamera` | Reset camera / recovery |
+| `/logs` | Log output for debugging |
+| `/diagnostics/camera` | Camera diagnostics |
+| `/diagnostics/reboot` | Reboot-related diagnostics |
+| `/checkUpdate` | Check for application update |
+| `/triggerUpdate` | Trigger update flow |
+| `/reboot` | Device reboot (privileged / device-owner contexts as implemented) |
 
-#### API-1.2: Response Format ✅ IMPLEMENTED
-**Requirement:** Consistent JSON response structure  
-**Status:** Complete
-
-```json
-{
-    "success": true,
-    "message": "Operation completed",
-    "data": { ... }
-}
-```
+#### API-1.2: Response Payloads ✅ IMPLEMENTED
+**Requirement:** Predictable behavior per endpoint  
+**Status:** Complete  
+**Note:** There is **no** single unified JSON envelope across all endpoints. Responses include ad-hoc JSON objects, plain text, binary JPEG (`/snapshot`), `multipart` MJPEG (`/stream`), and `text/event-stream` (`/events`). Clients should treat each route according to its `Content-Type` and documented handler behavior.
 
 #### API-1.3: CORS Support ✅ IMPLEMENTED
 **Requirement:** CORS headers for web-based clients  
@@ -369,30 +408,24 @@ This document specifies the complete requirements for the IP_Cam Android applica
 
 | Category | Total | Implemented | Partial | Open |
 |----------|-------|-------------|---------|------|
-| Functional | 18 | 16 | 2 | 0 |
+| Functional | 16 | 15 | 1 | 0 |
 | Non-Functional | 13 | 13 | 0 | 0 |
-| Technical | 11 | 11 | 0 | 0 |
-| API | 14 | 14 | 0 | 0 |
-| **TOTAL** | **56** | **54** | **2** | **0** |
+| Technical | 12 | 12 | 0 | 0 |
+| API | 5 | 5 | 0 | 0 |
+| **TOTAL** | **46** | **45** | **1** | **0** |
 
-**Completion Rate:** 96% (54/56 fully implemented)
+**Completion:** 45 of 46 requirement items fully implemented; 1 partial (FR-5.2). Approximately **97.8%** full implementation by item count.
 
 ### Open/Partial Items
 
-1. **FR-5.2: Server Port Configuration** ⚠️ PARTIAL
-   - Backend supports configuration
-   - No UI for user to change port
-   - Requires UI implementation
-
-2. **FR-5.3: Auto-Start on Boot** ⚠️ PARTIAL
-   - BootReceiver implemented
-   - Setting not exposed in UI
-   - Requires settings screen addition
+1. **FR-5.2: Server Port Configuration** ⚠️ PARTIAL  
+   - Preferred port is configurable in source (default 8080); server may bind to the next available port if busy.  
+   - No end-user settings UI to choose the port at runtime.
 
 ### Recommended Enhancements
 
 #### High Priority
-- [ ] Add settings screen for port and auto-start configuration
+- [ ] Add settings UI for HTTP listen port (runtime configuration)
 - [ ] Implement adaptive bitrate for MJPEG based on network conditions
 - [ ] Add authentication/security for network access
 
@@ -410,11 +443,11 @@ This document specifies the complete requirements for the IP_Cam Android applica
 
 ## Related Documentation
 
-- **[Implementation](IMPLEMENTATION.md)** - Current implementation details
-- **[Analysis](ANALYSIS.md)** - Architectural concepts and proposals
-- **[Testing](TESTING.md)** - Testing guides and procedures
+- **[Implementation](IMPLEMENTATION.md)** — Current implementation details  
+- **[Architecture](ARCHITECTURE.md)** — System structure and design  
+- **[Testing](TESTING.md)** — Testing guides and procedures  
 
 ---
 
 **Document Version:** 1.0  
-**Last Updated:** 2026-01-23
+**Last Updated:** 2026-03-26

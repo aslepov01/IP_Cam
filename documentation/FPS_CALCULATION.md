@@ -83,7 +83,7 @@ synchronized(mjpegFpsLock) {
 
 ## 3. RTSP Streaming FPS
 
-**Location**: `CameraService.recordRtspFrameEncoded()`, called from `RTSPServer.encodeFrame()`
+**Location**: `CameraService.recordRtspFrameEncoded()`, called from `RTSPServer.sendH264Frame()`
 
 **Purpose**: Measures the H.264 **encoding rate**, which is independent of how many clients consume the stream.
 
@@ -177,17 +177,17 @@ All three FPS metrics are displayed:
 ## Code Locations
 
 ### Camera FPS
-- **Tracking**: `CameraService.processMjpegFrame()` line ~1316
+- **Tracking**: `CameraService.processMjpegFrame()`
 - **Calculation**: Inline in `synchronized(fpsFrameTimes)` block
 
-### MJPEG FPS  
-- **Recording**: `HttpServer.serveStream()` line ~501, calls `cameraService.recordMjpegFrameServed()`
-- **Calculation**: `CameraService.recordMjpegFrameServed()` line ~2036
-- **Division by client count**: Line ~2055
+### MJPEG FPS
+- **Recording**: `HttpServer.serveStream()` calls `cameraService.recordMjpegFrameServed()`
+- **Calculation**: `CameraService.recordMjpegFrameServed()`
+- **Division by client count**: Applied in `recordMjpegFrameServed()` using `getMjpegClientCount()`
 
 ### RTSP FPS
-- **Recording**: `RTSPServer.encodeFrame()` line ~1163, calls `cameraService?.recordRtspFrameEncoded()`
-- **Calculation**: `CameraService.recordRtspFrameEncoded()` line ~2110
+- **Recording**: `RTSPServer.sendH264Frame()` calls `cameraService?.recordRtspFrameEncoded()`
+- **Calculation**: `CameraService.recordRtspFrameEncoded()`
 - **No division**: Encoding happens once for all clients
 
 ## Testing Recommendations

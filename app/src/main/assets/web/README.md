@@ -4,18 +4,18 @@ This directory contains the separated web interface files for the IP Camera serv
 
 ## File Structure
 
-- **index.html** - Main HTML structure with template placeholders (391 lines)
+- **index.html** - Main HTML structure with template placeholders (549 lines)
   - Contains the complete page structure with 6 tabs (Live Stream, Camera Controls, Stream Settings, RTSP, Server Management, API Reference)
   - Uses `{{variable}}` syntax for dynamic content substitution
   - References external CSS and JS files for modularity
 
-- **styles.css** - All CSS styling (97 lines)
+- **styles.css** - All CSS styling (731 lines)
   - Modern gradient background and card-based layout
   - Responsive design with mobile/tablet media queries
   - Material Design-inspired components (tabs, buttons, badges)
   - Fullscreen video support
 
-- **script.js** - All JavaScript functionality (847 lines)
+- **script.js** - All JavaScript functionality (1461 lines)
   - Tab switching and UI interactions
   - Server-Sent Events (SSE) for real-time updates
   - API calls to all server endpoints
@@ -30,6 +30,7 @@ The following template variables are replaced at runtime in `index.html`:
 - `{{versionString}}` - App version (from BuildInfo)
 - `{{buildString}}` - Build information (from BuildInfo)
 - `{{connectionDisplay}}` - Active long-lived connection summary (e.g., "3 active")
+- `{{adbConnection}}` - ADB connection info from `CameraService.getADBConnectionInfo()` (empty string when unavailable)
 
 ## How It Works
 

@@ -11,7 +11,7 @@ This test suite is intended to protect the core runtime while refactoring and wh
 Automated coverage currently includes:
 - HTTP server startup and health
 - manual camera lease acquire and release
-- one-shot snapshot capture
+- one-shot snapshot capture and concurrent snapshot callers
 - camera catalog validation and camera switching
 - format selection and connection limit normalization
 - flashlight API behavior on flash and non-flash cameras
@@ -19,10 +19,17 @@ Automated coverage currently includes:
 - live camera and format reconfiguration under active MJPEG and RTSP streams
 - MJPEG streaming, eviction, and cleanup
 - SSE streaming, eviction, and targeted shutdown
-- RTSP handshake, playback, pause/resume, eviction, and shutdown
+- RTSP handshake, playback, pause/resume, eviction, shutdown, and live bitrate/FPS reconfiguration
 - mixed SSE + MJPEG + RTSP consumer scenarios
 - server reachability after MainActivity closes
 - connection accounting and runtime telemetry quiescence
+- `/metrics` and `/stats` reporting
+- OSD overlay HTTP toggles and validation
+- `/restart` dropping long-lived clients while preserving limits
+- `/resetCamera` from idle and with active MJPEG
+- critical-battery streaming policy and override (where shell simulation works)
+- `BootReceiver` autostart behavior without full device reboot
+- target MJPEG/RTSP FPS and RTSP bitrate/mode HTTP APIs
 
 Manual testing remains useful for browser UX, external client compatibility, OTA flows, and long-duration thermal checks, but core regressions should be caught by the automated suite first.
 
@@ -54,63 +61,43 @@ Location:
 - `app/src/androidTest/java/com/ipcam/testsupport`
 
 Current suite size:
-- 32 real-device instrumentation tests
+- **59** real-device instrumentation tests across **17** test classes
 
-Covered areas by class:
+Covered areas by class (each line lists the `@Test` count):
 
-- `ServerAndLifecycleInstrumentedTest`
-  - `/status` reports healthy server state
-  - manual camera lease transitions `IDLE -> ACTIVE -> IDLE`
-  - snapshot acquires and releases the camera cleanly
+- **`ServerAndLifecycleInstrumentedTest`** (4) — `/status` health, manual camera lease `IDLE -> ACTIVE -> IDLE`, snapshot acquire/release, baseline lifecycle behavior.
 
-- `CameraConfigurationInstrumentedTest`
-  - `/cameras` integrity
-  - invalid camera selection rejection
-  - alternate camera selection on multi-camera devices
-  - format changes
-  - connection limit normalization through HTTP API
+- **`CameraConfigurationInstrumentedTest`** (5) — `/cameras` integrity, invalid camera rejection, multi-camera selection, format changes, connection limits via HTTP API.
 
-- `MjpegStreamingInstrumentedTest`
-  - multipart MJPEG stream happy path
-  - same-client eviction
-  - global limit eviction
-  - post-eviction cleanup and telemetry quiescence
+- **`MjpegStreamingInstrumentedTest`** (4) — multipart MJPEG happy path, same-client eviction, global limit eviction, post-eviction cleanup and telemetry quiescence.
 
-- `SseStreamingInstrumentedTest`
-  - SSE event stream happy path
-  - SSE does not activate the camera by itself
-  - SSE limit eviction
-  - targeted client shutdown through `/closeConnection`
+- **`SseStreamingInstrumentedTest`** (6) — SSE event stream happy path, SSE not activating the camera alone, limit eviction, targeted shutdown via `/closeConnection`, and related SSE edge cases.
 
-- `RtspStreamingInstrumentedTest`
-  - RTSP `OPTIONS`, `DESCRIBE`, `SETUP`, `PLAY`, `TEARDOWN`
-  - interleaved RTP over TCP
-  - RTSP session limit eviction
-  - cleanup after disconnect without explicit `TEARDOWN`
-  - `PAUSE` releases the lease and `PLAY` reacquires it
-  - disabling RTSP with an active client
-  - passive `DESCRIBE` lease and release on socket close
+- **`RtspStreamingInstrumentedTest`** (7) — RTSP `OPTIONS` through `TEARDOWN`, interleaved RTP over TCP, session limit eviction, cleanup without explicit `TEARDOWN`, `PAUSE`/`PLAY` lease behavior, disabling RTSP with an active client, passive `DESCRIBE` lease lifecycle.
 
-- `ConnectionManagementInstrumentedTest`
-  - mixed SSE + MJPEG + RTSP connection accounting
-  - camera remains active until the last video consumer disconnects
-  - concurrent MJPEG streams from distinct client addresses
-  - targeted MJPEG shutdown through `/closeConnection`
+- **`ConnectionManagementInstrumentedTest`** (6) — mixed SSE + MJPEG + RTSP accounting, camera stays active until the last video consumer disconnects, concurrent MJPEG from distinct client addresses, targeted MJPEG shutdown.
 
-- `DynamicReconfigurationInstrumentedTest`
-  - camera switching while MJPEG is already streaming
-  - format changes while MJPEG is already streaming
-  - camera switching while RTSP is already playing
-  - format changes while RTSP is already playing
+- **`DynamicReconfigurationInstrumentedTest`** (4) — camera and format changes while MJPEG or RTSP is already active.
 
-- `FlashlightAndPersistenceInstrumentedTest`
-  - flashlight `toggle`, `flashOn`, and `flashOff` on flash-capable cameras
-  - graceful flashlight rejection on cameras without flash
-  - persistence of selected camera, format, and rotation across app restart
+- **`FlashlightAndPersistenceInstrumentedTest`** (5) — flashlight `toggle` / `flashOn` / `flashOff` on capable hardware, graceful rejection without flash, persistence of camera, format, and rotation across app restart.
 
-- `ServicePersistenceInstrumentedTest`
-  - server remains reachable after MainActivity closes
-  - snapshot capture still works after the activity is gone
+- **`ServicePersistenceInstrumentedTest`** (1) — after closing MainActivity, server stays reachable and snapshots still work with the service in the background.
+
+- **`BatteryPolicyInstrumentedTest`** (1) — critical-battery streaming policy via shell battery simulation: service state, MJPEG blocked or overridden per API, recovery when level is raised (skipped when simulation is ineffective).
+
+- **`BootReceiverInstrumentedTest`** (3) — `BootReceiver` autostart vs preferences by invoking `onReceive` directly (no full reboot), CE vs device-protected storage alignment.
+
+- **`CameraResetInstrumentedTest`** (2) — `/resetCamera` from idle (fresh snapshot, clean connections) and with active MJPEG (pipeline restarts, stream recovers, clean teardown).
+
+- **`MetricsAndStatsInstrumentedTest`** (2) — `/metrics` field completeness at idle; under load metrics reflect streaming; `/stats` plain-text sections.
+
+- **`OverlayConfigurationInstrumentedTest`** (2) — OSD overlay HTTP endpoints (date/time, battery, resolution, FPS): truthy/falsy values, invalid input rejection, applied flags in JSON.
+
+- **`RestartServerInstrumentedTest`** (1) — `/restart` disconnects long-lived SSE/MJPEG clients, HTTP comes back, persisted connection limits unchanged, clean idle teardown.
+
+- **`SnapshotConcurrencyInstrumentedTest`** (3) — concurrent `/snapshot` threads all get JPEGs without wedging; `/snapshot` while MJPEG is active (stream keeps frames); `/snapshot` while RTSP is playing (RTP continues until teardown).
+
+- **`StreamRateAndRtspConfigInstrumentedTest`** (3) — `/setMjpegFps` and `/setRtspFps` validation; RTSP bitrate and bitrate-mode validation; `/rtspStatus` vs live changes while a TCP RTSP session is playing.
 
 Run:
 
@@ -157,7 +144,7 @@ Isolation mechanisms:
 - RTSP is disabled during teardown if needed
 - preferences and external test files are cleared
 
-Supporting classes:
+Supporting classes (under `app/src/androidTest/java/com/ipcam/testsupport`):
 - `BaseDeviceCoreTest`
 - `DeviceTestEnvironment`
 - `LongLivedClients.kt`
@@ -294,7 +281,6 @@ Some phones show a Play Protect warning for the instrumentation APK during local
 ## Related Documentation
 
 - [README.md](/Users/aslepov/projects/IP_Cam/README.md)
-- [IMPLEMENTATION.md](/Users/aslepov/projects/IP_Cam/documentation/IMPLEMENTATION.md)
-- [REQUIREMENTS.md](/Users/aslepov/projects/IP_Cam/documentation/REQUIREMENTS.md)
+- [ARCHITECTURE.md](/Users/aslepov/projects/IP_Cam/documentation/ARCHITECTURE.md)
 
-**Last Updated:** 2026-03-23
+**Last Updated:** 2026-03-26

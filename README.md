@@ -143,7 +143,7 @@ To set up auto-update releases for your fork:
 1. Follow the [Signing Setup Guide](documentation/SIGNING_SETUP.md)
 2. Generate a release keystore
 3. Add GitHub secrets (SIGNING_KEY, KEY_STORE_PASSWORD, ALIAS, KEY_PASSWORD)
-4. Merge PRs to main branch to trigger automatic releases
+4. Merge PRs to main branch to trigger automatic releases (workflow: [.github/workflows/version-and-release.yml](.github/workflows/version-and-release.yml))
 
 See [AUTO_UPDATE_IMPLEMENTATION.md](documentation/AUTO_UPDATE_IMPLEMENTATION.md) for complete details.
 
@@ -151,19 +151,22 @@ See [AUTO_UPDATE_IMPLEMENTATION.md](documentation/AUTO_UPDATE_IMPLEMENTATION.md)
 
 Comprehensive documentation is available in the [`/documentation`](documentation/) directory:
 
-- **[Implementation Guide](documentation/IMPLEMENTATION.md)** - Architecture and implementation details
-- **[Requirements Specification](documentation/REQUIREMENTS.md)** - Complete requirements with status
-- **[Analysis & Concepts](documentation/ANALYSIS.md)** - Architectural analysis and proposals
-- **[Testing Guide](documentation/TESTING.md)** - Automated core suite, device setup, and troubleshooting
-- **[Auto Update Implementation](documentation/AUTO_UPDATE_IMPLEMENTATION.md)** - OTA update system guide
-- **[Signing Setup Guide](documentation/SIGNING_SETUP.md)** - APK signing for auto updates
+- **[Implementation Guide](documentation/IMPLEMENTATION.md)** — Implementation details
+- **[Requirements Specification](documentation/REQUIREMENTS.md)** — Complete requirements with status
+- **[Architecture](documentation/ARCHITECTURE.md)** — Architecture and system design
+- **[Camera Reset & Reboot Guide](documentation/CAMERA_RESET_AND_REBOOT_GUIDE.md)** — Recovery and reboot behavior
+- **[Device Owner Troubleshooting](documentation/DEVICE_OWNER_TROUBLESHOOTING.md)** — Device owner / kiosk scenarios
+- **[FPS Calculation](documentation/FPS_CALCULATION.md)** — How frame rates are derived
+- **[Testing Guide](documentation/TESTING.md)** — Automated core suite, device setup, and troubleshooting
+- **[Silent Updates](documentation/SILENT_UPDATES.md)** — Silent / unattended update paths
+- **[Auto Update Implementation](documentation/AUTO_UPDATE_IMPLEMENTATION.md)** — OTA update system guide
+- **[Signing Setup Guide](documentation/SIGNING_SETUP.md)** — APK signing for auto updates
 
 ## Building from Source
 
 ### Prerequisites
-- Android Studio (Arctic Fox or later)
-- Android SDK (API 34)
-- JDK 17+ (or the bundled JBR from Android Studio)
+- Android SDK (API 35 for compile, target 33)
+- JDK 17+
 
 ### Build Steps
 ```bash
@@ -187,7 +190,7 @@ ANDROID_SERIAL=<device-serial> ./gradlew connectedDebugAndroidTest
 ```
 
 The automated suite includes JVM unit tests plus a real-device instrumentation suite that exercises server lifecycle, camera leasing, MJPEG, SSE, RTSP, connection eviction, and cleanup scenarios. See [Testing Guide](documentation/TESTING.md) for the full coverage map and device setup notes.
-It also covers flashlight API behavior, app-restart persistence, live camera/format reconfiguration during active streams, and service availability after the activity closes. The current device suite contains 32 instrumentation tests.
+It also covers flashlight API behavior, app-restart persistence, live camera/format reconfiguration during active streams, and service availability after the activity closes. The current device suite contains **59** instrumentation tests across **17** test classes.
 
 ## Requirements
 

@@ -145,7 +145,7 @@ Your expertise centers on six critical areas for IP camera applications:
 - On-demand binding: Initialize camera when first client connects, not at service start
 - Validation checks: Verify camera binding succeeded, frames are flowing
 - Recovery triggers: Frame timeout, binding failure, camera disconnection event
-- State machine: Track initialization states (IDLE → INITIALIZING → BOUND → FAILED → RECOVERING)
+- State machine: Track initialization states (IDLE → INITIALIZING → ACTIVE → STOPPING → ERROR)
 
 ### Persistent Background Services
 - Foreground service with `android:foregroundServiceType="camera"`, START_STICKY
@@ -157,15 +157,15 @@ Your expertise centers on six critical areas for IP camera applications:
 
 ### Usability Best Practices
 - Real-time status (connection count, camera state, server status)
-- One-tap controls for start/stop/switch/flashlight
+- One-tap controls for start/stop/camera select/flashlight
 - Auto-refresh (2 seconds), immediate UI updates
 - Responsive web UI (mobile/desktop)
 - RESTful API with predictable JSON responses
 
 ### Surveillance Software Integration
 - Standard endpoints: `/stream` (MJPEG), `/snapshot` (JPEG), `/status` (JSON)
-- Control: `/switch`, `/toggleFlashlight`, `/setRotation`, `/setFormat`
-- 32+ simultaneous clients with thread pool
+- Control: `/selectCamera`, `/toggleFlashlight`, `/setRotation`, `/setFormat`
+- 32+ simultaneous clients via coroutine-based server
 - Proper headers: multipart/x-mixed-replace, CORS, chunked transfer
 - Compatible with ZoneMinder, Shinobi, Blue Iris, MotionEye
 
@@ -201,7 +201,7 @@ CameraService (ForegroundService + LifecycleOwner)
   ├── On-Demand Initialization
   │   ├── Lazy binding: initialize when first consumer appears
   │   ├── Supervised init: timeout + retry logic
-  │   └── State machine: IDLE → INITIALIZING → BOUND → FAILED
+  │   └── State machine: IDLE → INITIALIZING → ACTIVE → STOPPING → ERROR
   ├── Frame Distributor (single source, multiple sinks)
   │   ├── Zero-copy where possible (shared Image reference)
   │   ├── Efficient conversion: YUV → JPEG/H.264
@@ -215,8 +215,8 @@ CameraService (ForegroundService + LifecycleOwner)
 - Main: UI/lifecycle only, never blocks
 - Camera Executor: Single thread for CameraX analysis callbacks
 - Processing Executor: 2-thread pool for image processing (rotation, JPEG encoding)
-- HTTP Pool: 32 threads for HTTP request handlers
-- Streaming Executor: Unbounded cached pool for long-lived streams (MJPEG, RTSP)
+- Ktor CIO: Coroutine-based HTTP handling
+- RTSP: Per-client threads for RTSP streaming
 - Watchdog: Separate coroutine/thread for health monitoring
 - Background: File I/O, logging, settings persistence
 
@@ -252,7 +252,7 @@ CameraService (ForegroundService + LifecycleOwner)
 1. On-demand binding: initialize only when needed
 2. Timeout protection: 5-10 second timeout on binding operations
 3. Retry with exponential backoff: 1s, 2s, 4s, 8s, 16s, max 30s
-4. State machine: IDLE → INITIALIZING → BOUND → FAILED → RECOVERING
+4. State machine: IDLE → INITIALIZING → ACTIVE → STOPPING → ERROR
 5. Validation: Check binding succeeded and frames are flowing
 6. Separate watchdog coroutine for non-blocking health checks
 7. Detect failures: frame timeout (15s), binding errors, camera disconnection
@@ -297,10 +297,11 @@ CameraService (ForegroundService + LifecycleOwner)
 
 ### Core Libraries
 ```kotlin
-// Camera: androidx.camera (1.3.1)
-// HTTP: org.nanohttpd (2.3.1)
-// Coroutines: kotlinx-coroutines-android (1.7.3)
-// Lifecycle: androidx.lifecycle (2.6.2)
+// Camera: androidx.camera (1.4.1)
+// HTTP: io.ktor (2.3.12) — Ktor CIO engine
+// Coroutines: kotlinx-coroutines-android (1.9.0)
+// Lifecycle: androidx.lifecycle (2.8.7)
+// Language: Kotlin 2.1.0
 ```
 
 ### Build Configuration
@@ -308,7 +309,8 @@ CameraService (ForegroundService + LifecycleOwner)
 android {
     defaultConfig {
         minSdk = 30  // Android 11+
-        targetSdk = 34  // Android 14
+        targetSdk = 33  // Android 13
+        compileSdk = 35
     }
 }
 ```
@@ -378,7 +380,7 @@ GET /              - Web interface with live stream
 GET /stream        - MJPEG video (multipart/x-mixed-replace)
 GET /snapshot      - Single JPEG image
 GET /status        - JSON status (camera, connections, settings)
-GET /switch        - Switch camera (JSON response)
+GET /selectCamera?cameraId=ID - Select specific camera
 GET /toggleFlashlight - Toggle flashlight (JSON response)
 GET /setRotation?value=0|90|180|270|auto
 GET /setFormat?value=WIDTHxHEIGHT
@@ -456,7 +458,7 @@ data class StreamingConfig(
 curl http://DEVICE_IP:8080/status
 curl http://DEVICE_IP:8080/snapshot -o test.jpg
 curl http://DEVICE_IP:8080/stream > stream.mjpeg &
-curl http://DEVICE_IP:8080/switch
+curl http://DEVICE_IP:8080/selectCamera?cameraId=0
 vlc http://DEVICE_IP:8080/stream
 ```
 
@@ -521,7 +523,7 @@ CameraService (single camera binding manager)
   │   ├── HTTP/MJPEG clients
   │   └── RTSP/H.264 clients
   ├── Hardware Acceleration (MediaCodec, YUV processing, GPU)
-  ├── NanoHTTPD (HTTP/MJPEG server, 32+ clients)
+  ├── Ktor CIO (HTTP/MJPEG server, coroutine-based)
   ├── RTSPServer (RTSP/H.264 streaming)
   ├── Network Monitor (WiFi changes, restart on network loss)
   └── Settings Manager (SharedPreferences, unified state)
@@ -538,5 +540,5 @@ BootReceiver → Auto-start on boot (optional, for true dedicated mode)
 - Non-blocking streams: HTTP returns immediately, streaming offloaded to separate executor
 - Watchdog monitoring: Health checks with automatic recovery on failure detection
 - Home launcher mode: HOME intent filter makes device a dedicated IP camera
-- Thread separation: Camera executor (1) + Processing (2) + HTTP pool (32) + Streaming (unbounded)
+- Thread separation: Camera executor (1) + Processing (2) + Ktor CIO (coroutines) + RTSP (per-client threads)
 

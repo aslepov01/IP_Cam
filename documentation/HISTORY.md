@@ -32,21 +32,12 @@ This document provides a consolidated summary of significant features, fixes, an
 - Simplified lifecycle management
 - Easier debugging and maintenance
 
-**Reference:** Based on `SINGLE_SOURCE_OF_TRUTH.md`
-
 ### Connection Handling Architecture
-**Problem Solved:** Thread pool exhaustion causing connection failures
+**Problem Solved:** With the earlier HTTP stack, a small thread pool could not sustain many long-lived streaming connections (`/stream`, `/events`).
 
-**Original Issue:** 8-thread pool couldn't handle long-lived streaming connections (`/stream`, `/events`)
+**Solution (current):** HTTP is served by **Ktor** with the **CIO** engine—a coroutine-based server that does not use a fixed-size thread pool for HTTP the way the previous design did. Request and stream handling is structured around coroutines and dispatchers rather than a bounded executor whose threads long-lived clients could exhaust.
 
-**Solution:**
-- Expanded thread pool to 32 threads for HTTP requests
-- Created unbounded cached thread pool for long-lived streams
-- Separated quick requests from streaming operations
-
-**Result:** Supports 32+ concurrent connections without degradation
-
-**Reference:** Based on `ARCHITECTURE.md`
+**Result:** Many concurrent connections are supported without the same thread-pool exhaustion class of failures.
 
 ### Streaming Architecture
 **Current Implementation:** MJPEG (Motion JPEG) streaming
@@ -69,8 +60,6 @@ Camera (YUV_420_888) → Rotation → YUV-to-Bitmap → JPEG Compression → Net
 - Efficient memory management (bitmap recycling)
 - Frame dropping for slow clients
 
-**Reference:** Based on `STREAMING_ARCHITECTURE.md`
-
 ---
 
 ## Core Features
@@ -88,8 +77,6 @@ Camera (YUV_420_888) → Rotation → YUV-to-Bitmap → JPEG Compression → Net
 
 **Status:** ✅ Fully implemented and tested
 
-**Reference:** Based on `PERSISTENCE_IMPLEMENTATION.md`
-
 ### Lifecycle Management
 **Problem Solved:** Callbacks to destroyed Activity contexts causing crashes
 
@@ -103,8 +90,6 @@ Camera (YUV_420_888) → Rotation → YUV-to-Bitmap → JPEG Compression → Net
 - No memory leaks
 - No crashes from dead context access
 - Clean separation between service and UI
-
-**Reference:** Based on `LIFECYCLE_MANAGEMENT.md`
 
 ### Launcher UI Implementation
 **Goal:** Modern, intuitive Material Design interface
@@ -121,8 +106,6 @@ Camera (YUV_420_888) → Rotation → YUV-to-Bitmap → JPEG Compression → Net
 - Information hierarchy (most important always visible)
 - Progressive disclosure (advanced settings collapsible)
 - Immediate visual feedback
-
-**Reference:** Based on `LAUNCHER_UI_IMPLEMENTATION.md`
 
 ### Version Management System
 **Purpose:** Automated version tracking and API exposure
@@ -143,8 +126,6 @@ versionName = "major.minor.patch"
 - Single source for version information
 - Automated version management
 - API clients can check compatibility
-
-**Reference:** Based on `VERSION_SYSTEM.md`, `AUTOMATED_VERSION_MANAGEMENT.md`
 
 ---
 
@@ -167,8 +148,6 @@ versionName = "major.minor.patch"
 
 **Decision:** Keep MJPEG as primary, RTSP as optional for bandwidth-constrained scenarios
 
-**Reference:** Based on `RTSP_RECOMMENDATION.md`, `RTSP_IMPLEMENTATION.md`
-
 ### RTSP Reliability Improvements
 **Issues Fixed:**
 1. Frame dropping causing stuttering
@@ -184,8 +163,6 @@ versionName = "major.minor.patch"
 
 **Result:** Stable 30 fps RTSP streaming with smooth playback
 
-**Reference:** Based on `RTSP_RELIABILITY_FIX.md`, `RTSP_FPS_DELAY_FIX_VISUAL_SUMMARY.md`, `RTSP_TARGET_FPS_ENFORCEMENT_FIX.md`
-
 ### RTSP Frame Dropping Implementation
 **Purpose:** Handle slow clients gracefully
 
@@ -199,8 +176,6 @@ versionName = "major.minor.patch"
 - Prevents memory buildup
 - Maintains service stability
 - Graceful degradation under load
-
-**Reference:** Based on `RTSP_FRAME_DROPPING_IMPLEMENTATION.md`
 
 ---
 
@@ -221,8 +196,6 @@ versionName = "major.minor.patch"
 - Per-client tracking
 - Performance metrics exposed via `/status` endpoint
 
-**Reference:** Based on `BANDWIDTH_OPTIMIZATION_SUMMARY.md`
-
 ### Image Processing Decoupling
 **Problem:** Camera capture blocking on image processing
 
@@ -236,8 +209,6 @@ versionName = "major.minor.patch"
 - Camera capture never blocks
 - Smooth frame delivery
 - Better CPU utilization
-
-**Reference:** Based on `IMAGE_PROCESSING_DECOUPLING.md`, `DECOUPLING_SUMMARY.md`
 
 ### Bitmap Memory Management
 **Goal:** Reduce GC pressure and memory usage
@@ -263,8 +234,6 @@ try {
 - Fewer GC pauses
 - Stable long-term operation
 
-**Reference:** Based on `BITMAP_MEMORY_MANAGEMENT.md`
-
 ### YUV-to-Bitmap Optimization
 **Challenge:** YUV conversion is CPU-intensive
 
@@ -277,8 +246,6 @@ try {
 **Current:** Using available system implementations (varies by device)
 
 **Future:** Consider native implementation for consistent performance
-
-**Reference:** Based on `YUV_TO_BITMAP_OPTIMIZATION.md`
 
 ### Camera Efficiency Analysis
 **Topic:** CameraX VideoCapture API for improved efficiency
@@ -293,8 +260,6 @@ try {
 
 **Status:** Analysis complete, not yet implemented (significant refactoring required)
 
-**Reference:** Based on `CAMERA_EFFICIENCY_ANALYSIS.md`, `CAMERAX_PARALLEL_PIPELINES_IMPLEMENTATION.md`
-
 ### Wake Lock & FPS Improvements
 **Issues:** Inconsistent FPS, device sleeping during operation
 
@@ -307,8 +272,6 @@ try {
 - Consistent frame delivery
 - No interruptions during streaming
 - Improved battery efficiency
-
-**Reference:** Based on `WAKE_LOCK_FPS_IMPROVEMENTS.md`, `IMPLEMENTATION_SUMMARY_WAKE_LOCK_FPS.md`
 
 ---
 
@@ -328,8 +291,6 @@ try {
 - Camera binding fails
 - Network disconnects
 
-**Reference:** Integrated into `PERSISTENCE_IMPLEMENTATION.md`
-
 ### Boot Receiver Fixes
 **Issues:**
 - Android 14+ boot receiver not working
@@ -342,8 +303,6 @@ try {
 
 **Result:** Service starts on boot across all supported Android versions
 
-**Reference:** Based on `BOOT_RECEIVER_FIX.md`, `ANDROID_14_BOOT_FIX.md`, `API35_BOOT_FIX.md`
-
 ### Debounce Enhancement
 **Problem:** Rapid state changes causing instability
 
@@ -353,8 +312,6 @@ try {
 - Ignore duplicate requests within time window
 - Queue operations if needed
 - Prevent race conditions
-
-**Reference:** Based on `DEBOUNCE_ENHANCEMENT_SUMMARY.md`
 
 ---
 
@@ -368,8 +325,6 @@ try {
 - Ensure preview and encoder use same camera
 - Update state atomically
 
-**Reference:** Based on `FIX_SUMMARY_RTSP_CAMERA.md`
-
 ### RTSP Preview Resolution Mismatch
 **Issue:** Preview resolution different from encoder resolution
 
@@ -378,8 +333,6 @@ try {
 - Update UI to reflect actual dimensions
 - Validate resolution compatibility
 
-**Reference:** Based on `RTSP_PREVIEW_RESOLUTION_FIX.md`
-
 ### General Fixes
 Various bug fixes documented throughout development:
 - Thread safety issues
@@ -387,15 +340,13 @@ Various bug fixes documented throughout development:
 - State synchronization
 - Permission handling
 
-**Reference:** Based on `FIX_SUMMARY.md`, `VISUAL_FIX_DIAGRAM.md`
-
 ---
 
 ## Migrations & Refactoring
 
 ### Ktor Migration
 **From:** NanoHTTPD (simple HTTP server)
-**To:** Ktor (modern Kotlin web framework)
+**To:** Ktor **2.3.12** (Kotlin web framework)
 
 **Benefits:**
 - Better coroutine support
@@ -410,22 +361,18 @@ Various bug fixes documented throughout development:
 
 **Status:** ✅ Complete
 
-**Reference:** Based on `KTOR_MIGRATION_SUMMARY.md`
-
 ### Dependency Migration
 **Goal:** Update to modern libraries
 
 **Changes:**
-- Updated CameraX dependencies
-- Migrated to Kotlin coroutines
+- CameraX **1.4.1**
+- Kotlin coroutines **1.9.0**
 - Updated Gradle and build tools
 
 **Benefits:**
 - Security patches
 - Performance improvements
 - New features
-
-**Reference:** Based on `DEPENDENCY_MIGRATION.md`, `PR_SUMMARY_DEPENDENCY_MIGRATION.md`
 
 ### Web UI Refactoring
 **Goal:** Improve maintainability and user experience
@@ -441,8 +388,6 @@ Various bug fixes documented throughout development:
 - Better UX
 - More reliable updates
 
-**Reference:** Based on `WEB_UI_REFACTORING_SUMMARY.md`
-
 ### Settings Audit
 **Purpose:** Ensure all settings are properly persisted
 
@@ -452,8 +397,6 @@ Various bug fixes documented throughout development:
 - Proper defaults on first run
 
 **Result:** No settings lost on restart or crash
-
-**Reference:** Based on `SETTINGS_AUDIT_REPORT.md`
 
 ---
 
@@ -471,8 +414,6 @@ Various bug fixes documented throughout development:
 - `test_rtsp_reliability.sh` - Long-running stability test
 - `test_concurrent_connections.sh` - Load testing
 
-**Reference:** Based on `RTSP_TESTING_GUIDE.md`, testing guide documents
-
 ### Image Processing Testing
 **Focus:** YUV conversion, bitmap handling, memory leaks
 
@@ -482,16 +423,12 @@ Various bug fixes documented throughout development:
 - CPU usage monitoring
 - Visual quality verification
 
-**Reference:** Based on `TESTING_GUIDE_IMAGE_PROCESSING.md`
-
 ### Web UI Testing
 **Coverage:**
 - Browser compatibility (Chrome, Firefox, Safari, Edge)
 - Responsive design (mobile/desktop)
 - SSE event delivery
 - Button functionality
-
-**Reference:** Based on `WEB_UI_TESTING_GUIDE.md`
 
 ---
 
@@ -509,11 +446,11 @@ This history represents the evolution of IP_Cam from a simple MJPEG streamer to 
 For current implementation details, refer to:
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) - How it works now
 - [REQUIREMENTS.md](REQUIREMENTS.md) - What it does
-- [ANALYSIS.md](ANALYSIS.md) - Future directions
+- [ARCHITECTURE.md](ARCHITECTURE.md) - System structure and design
 - [TESTING.md](TESTING.md) - How to test
 
 ---
 
 **Document Version:** 1.0  
 **Consolidated From:** 61 historical documents  
-**Last Updated:** 2026-01-23
+**Last Updated:** 2026-03-26

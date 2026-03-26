@@ -19,7 +19,7 @@
 2. **Via Web:** Click "Reset Camera" button
 3. **Via API:** `GET http://DEVICE_IP:8080/resetCamera`
 
-**What it does:** Restarts the camera service within the app (unbind camera, clear provider, rebind)
+**What it does:** Restarts the camera service within the app via `CameraService.fullCameraReset()` (unbind camera, clear provider, reset state, rebind). Reported state uses `CameraState` names such as **ACTIVE** (healthy) and **ERROR** (failure), not "BOUND".
 
 **What it does NOT do:** Fix system-level camera failures (requires device reboot)
 
@@ -36,7 +36,7 @@
 2. **If Device Owner + Unlocked:** Press "Reboot Device" button
 3. **Via API:** `GET http://DEVICE_IP:8080/reboot`
 
-**What happens:** App tries 3 different reboot methods automatically
+**What happens:** App tries 3 different reboot methods automatically (`RebootHelper.rebootDevice(context)` in `RebootHelper.kt`). Reboot diagnostics use `RebootHelper.diagnoseRebootCapability(context)`. The HTTP API and UI delegate to this helper rather than implementing separate reboot logic in `MainActivity` or `DeviceAdminReceiver`.
 
 ---
 
@@ -92,13 +92,13 @@ No device owner set
 **Symptoms:**
 - Reset completes successfully
 - Stream still doesn't work
-- App says camera is "BOUND" but no video
+- App says camera is "ACTIVE" but no video
 
 **Diagnosis:**
 1. Click "Camera Diagnostics" button
 2. Check these values:
    - `permissionGranted`: Must be `true`
-   - `cameraState`: Should be "BOUND"
+   - `cameraState`: Should be "ACTIVE" when the pipeline is healthy (see also IDLE / INITIALIZING while starting; ERROR means failure)
    - `lastFrameSizeBytes`: Should be > 0
 
 **Solution:**
@@ -163,7 +163,7 @@ Knox: 3.7 (or any version)
 
 **Diagnosis:** Samsung Knox may be blocking reboot even with Device Owner
 
-**What the app does:** Automatically tries 3 different reboot methods:
+**What the app does:** `RebootHelper.rebootDevice()` automatically tries 3 different reboot methods:
 1. DevicePolicyManager.reboot() - Official API
 2. PowerManager.reboot() - Alternative method
 3. Shell exec "reboot" - Last resort
@@ -280,7 +280,7 @@ Device owner: ComponentInfo{com.ipcam/com.ipcam.DeviceAdminReceiver}
 ```json
 {
   "status": "ok",
-  "cameraState": "BOUND",
+  "cameraState": "ACTIVE",
   "consumerCount": 3,
   "hasLastFrame": true,
   "lastFrameSizeBytes": 45678,
@@ -295,7 +295,7 @@ Device owner: ComponentInfo{com.ipcam/com.ipcam.DeviceAdminReceiver}
 ```
 
 **What to check:**
-- ✅ `cameraState`: "BOUND" = good, "ERROR" = problem
+- ✅ `cameraState`: "ACTIVE" = good, "ERROR" = problem (also IDLE / INITIALIZING during startup)
 - ✅ `permissionGranted`: Must be `true`
 - ✅ `lastFrameSizeBytes`: > 0 = camera working
 - ✅ `currentFps`: > 0 = frames flowing
@@ -353,10 +353,12 @@ curl http://DEVICE_IP:8080/resetCamera
 ```json
 {
   "status": "ok",
-  "cameraState": "BOUND",
+  "cameraState": "ACTIVE",
   "message": "Camera reset successfully initiated"
 }
 ```
+
+(`cameraState` is the current `CameraState` name from the service, e.g. ACTIVE, IDLE, INITIALIZING, or ERROR.)
 
 **Failure Response:**
 ```json
@@ -397,6 +399,8 @@ curl http://DEVICE_IP:8080/reboot
   "message": "Device must be unlocked to reboot"
 }
 ```
+
+Other failures may return `error`: `security_exception` (with `method`) or `all_methods_failed` (with per-method details and `diagnostics`), matching `RebootResult.toJson()` in the app.
 
 ### Camera Diagnostics
 ```bash
@@ -579,7 +583,7 @@ If fails, see `documentation/DEVICE_OWNER_TROUBLESHOOTING.md` for alternative me
 1. ✅ Check "Reboot Diagnostics" first
 2. ✅ Ensure Device Owner status (not just Device Admin)
 3. ✅ Ensure device is unlocked
-4. ✅ App tries 3 fallback methods automatically
+4. ✅ `RebootHelper` tries 3 fallback methods automatically (`RebootHelper.rebootDevice()`)
 
 ### Root Access
 
@@ -591,7 +595,6 @@ If fails, see `documentation/DEVICE_OWNER_TROUBLESHOOTING.md` for alternative me
 
 ## Additional Resources
 
-- **Technical Investigation:** `documentation/CAMERA_RESET_AND_REBOOT_INVESTIGATION.md`
 - **Device Owner Setup:** `documentation/DEVICE_OWNER_TROUBLESHOOTING.md`
 - **Silent Updates:** `documentation/SILENT_UPDATES.md`
 

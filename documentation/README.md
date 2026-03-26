@@ -1,80 +1,49 @@
-# IP_Cam Documentation
+# IP_Cam documentation index
 
-This directory contains comprehensive documentation for the IP_Cam Android application.
+This directory holds project documentation for the IP_Cam Android app. Use the sections below to find the right file.
 
-## Main Documents
+## Core documentation
 
-These are the primary documents providing complete overview of the project:
+| Document | Description |
+|----------|-------------|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | System architecture, components, data flow, and threading model. Replaces the former `ANALYSIS.md` overview. |
+| [IMPLEMENTATION.md](IMPLEMENTATION.md) | Implementation details for each component (streaming, lifecycle, web server, persistence, and related behavior). |
+| [REQUIREMENTS.md](REQUIREMENTS.md) | Requirements specification with implementation status. |
+| [TESTING.md](TESTING.md) | Test suite guide: JVM tests plus 59 on-device instrumentation tests, execution, and troubleshooting. |
 
-### [IMPLEMENTATION.md](IMPLEMENTATION.md)
-**Current state documentation** covering:
-- System architecture and components
-- Streaming implementation (MJPEG and RTSP)
-- Lifecycle management
-- Persistence and reliability features
-- Camera management
-- Web server and UI
-- Performance optimizations
-- Version management
+## Operational guides
 
-### [REQUIREMENTS.md](REQUIREMENTS.md)
-**Requirements specification** with implementation status:
-- Functional requirements (camera, streaming, web interface, etc.)
-- Non-functional requirements (reliability, performance, compatibility, usability)
-- Technical requirements (frameworks, encoding, concurrency, lifecycle)
-- API requirements (HTTP endpoints, RTSP protocol)
-- Implementation status tracking (96% complete)
+| Document | Description |
+|----------|-------------|
+| [AUTO_UPDATE_IMPLEMENTATION.md](AUTO_UPDATE_IMPLEMENTATION.md) | OTA updates via GitHub Releases. **Implemented:** `UpdateManager.kt`, HTTP endpoints `/checkUpdate` and `/triggerUpdate`. |
+| [SIGNING_SETUP.md](SIGNING_SETUP.md) | APK signing configuration for auto updates. |
+| [CAMERA_RESET_AND_REBOOT_GUIDE.md](CAMERA_RESET_AND_REBOOT_GUIDE.md) | Camera reset and device reboot troubleshooting. |
+| [DEVICE_OWNER_TROUBLESHOOTING.md](DEVICE_OWNER_TROUBLESHOOTING.md) | Device Owner setup and troubleshooting. |
+| [SILENT_UPDATES.md](SILENT_UPDATES.md) | Silent update options for remotely managed devices. |
 
-### [ANALYSIS.md](ANALYSIS.md)
-**Architectural analysis and future concepts:**
-- Streaming protocol comparisons (RTSP vs alternatives)
-- Camera efficiency concepts (VideoCapture API analysis)
-- Architecture patterns (single source of truth, lifecycle-aware callbacks, watchdog)
-- Performance optimization strategies
-- Future enhancement proposals (authentication, multi-camera, motion detection, audio, etc.)
+## Technical reference
 
-### [TESTING.md](TESTING.md)
-**Testing procedures and guides:**
-- JVM unit tests for core runtime logic
-- Real-device instrumentation suite for lifecycle, streaming, reconfiguration, and persistence behavior
-- `adb` execution flow and device prerequisites
-- Manual exploratory checks and compatibility validation
-- Troubleshooting guide
+| Document | Description |
+|----------|-------------|
+| [FPS_CALCULATION.md](FPS_CALCULATION.md) | How FPS is tracked and reported for camera capture, MJPEG, and RTSP paths. |
+| [HISTORY.md](HISTORY.md) | Development history consolidated from 61 prior documents. |
 
-### [HISTORY.md](HISTORY.md)
-**Development history and evolution:**
-- Architecture evolution and design decisions
-- Major features and their implementation
-- Performance optimizations and improvements
-- Bug fixes and reliability enhancements
-- Migrations and refactoring efforts
-- Consolidated summary of 61 historical documents
+## Quick reference: questions → docs
 
-## Future Implementation Guides
-
-### [AUTO_UPDATE_IMPLEMENTATION.md](AUTO_UPDATE_IMPLEMENTATION.md)
-**Step-by-step guide for implementing OTA updates:**
-- Complete implementation plan for automatic over-the-air updates
-- Uses GitHub Releases for zero-cost hosting
-- Architecture and component design
-- Code examples and testing procedures
-- **Status:** Not yet implemented - future enhancement
-
-## Quick Reference
-
-| Need | See |
-|------|-----|
-| How it works now | [IMPLEMENTATION.md](IMPLEMENTATION.md) |
-| What features exist | [REQUIREMENTS.md](REQUIREMENTS.md) |
-| Design decisions & future plans | [ANALYSIS.md](ANALYSIS.md) |
-| How to test | [TESTING.md](TESTING.md) |
-| Why it works this way | [HISTORY.md](HISTORY.md) |
-| Future feature implementation | [AUTO_UPDATE_IMPLEMENTATION.md](AUTO_UPDATE_IMPLEMENTATION.md) |
+| Question | Start here |
+|----------|------------|
+| How is the app structured? Where does data flow and which threads run what? | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| How is a specific feature or module built? | [IMPLEMENTATION.md](IMPLEMENTATION.md) |
+| What was required, and is it done? | [REQUIREMENTS.md](REQUIREMENTS.md) |
+| How do I run unit and device tests? | [TESTING.md](TESTING.md) |
+| How do OTA updates work and what is wired up today? | [AUTO_UPDATE_IMPLEMENTATION.md](AUTO_UPDATE_IMPLEMENTATION.md) |
+| How do I sign builds for update compatibility? | [SIGNING_SETUP.md](SIGNING_SETUP.md) |
+| Camera or device reboot issues | [CAMERA_RESET_AND_REBOOT_GUIDE.md](CAMERA_RESET_AND_REBOOT_GUIDE.md) |
+| Device Owner / provisioning problems | [DEVICE_OWNER_TROUBLESHOOTING.md](DEVICE_OWNER_TROUBLESHOOTING.md) |
+| Updates without user interaction | [SILENT_UPDATES.md](SILENT_UPDATES.md) |
+| FPS numbers and how they are computed | [FPS_CALCULATION.md](FPS_CALCULATION.md) |
+| Why past decisions were made | [HISTORY.md](HISTORY.md) |
 
 ---
 
-**Documentation Structure:**
-- **5 main documents** cover all aspects (current, requirements, future, testing, history)
-- **1 implementation guide** for future features (auto-updates)
-- **Consolidated approach** eliminates clutter while preserving context
-- **Clear separation** between current state and historical evolution
+**Tracked documentation files (this index):** `ARCHITECTURE.md`, `IMPLEMENTATION.md`, `REQUIREMENTS.md`, `TESTING.md`, `AUTO_UPDATE_IMPLEMENTATION.md`, `SIGNING_SETUP.md`, `CAMERA_RESET_AND_REBOOT_GUIDE.md`, `DEVICE_OWNER_TROUBLESHOOTING.md`, `SILENT_UPDATES.md`, `FPS_CALCULATION.md`, `HISTORY.md`, and this `README.md`.
