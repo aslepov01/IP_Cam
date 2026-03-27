@@ -66,11 +66,12 @@ class DeviceTestEnvironment {
         path: String,
         host: String = LOOPBACK_HOST,
         expectedCode: Int? = 200,
-        readTimeoutMs: Int = 10_000
+        readTimeoutMs: Int = 10_000,
+        port: Int = 8080
     ): HttpResponse {
         openRawHttpGet(
             host = host,
-            port = 8080,
+            port = port,
             path = path,
             readTimeoutMs = readTimeoutMs,
             keepAlive = false
@@ -90,8 +91,9 @@ class DeviceTestEnvironment {
     fun jsonGet(
         path: String,
         host: String = LOOPBACK_HOST,
-        expectedCode: Int? = 200
-    ): JSONObject = httpGet(path, host, expectedCode).jsonObject()
+        expectedCode: Int? = 200,
+        port: Int = 8080
+    ): JSONObject = httpGet(path, host, expectedCode, readTimeoutMs = 10_000, port = port).jsonObject()
 
     fun openMjpegStream(host: String = LOOPBACK_HOST): MjpegStreamClient =
         MjpegStreamClient(host, 8080).also { trackedCloseables += it }
@@ -101,6 +103,9 @@ class DeviceTestEnvironment {
 
     fun openRtspTcp(host: String = LOOPBACK_HOST): RtspTcpClient =
         RtspTcpClient(host).also { trackedCloseables += it }
+
+    fun openRtspUdp(host: String = LOOPBACK_HOST): RtspUdpClient =
+        RtspUdpClient(host).also { trackedCloseables += it }
 
     fun setConnectionLimits(
         mjpegStreams: Int? = null,
@@ -243,6 +248,37 @@ class DeviceTestEnvironment {
     /** Loopback HTTP server port (8080) is accepting connections. */
     fun isLoopbackHttpServerReachable(): Boolean = isPortOpen(8080)
 
+    fun waitUntilLoopbackHttpServerStopped(timeoutMs: Long = 30_000L) {
+        waitUntil(timeoutMs, "HTTP server port 8080 to close") {
+            if (!isLoopbackHttpServerReachable()) Unit else null
+        }
+    }
+
+    fun waitUntilLoopbackHttpServerReady(timeoutMs: Long = 45_000L): JSONObject {
+        return waitUntil(timeoutMs, "HTTP server to accept requests") { jsonGet("/status") }
+    }
+
+    /**
+     * After [BootReceiver] autostart (or if 8080 is still occupied) the server may bind a higher port.
+     */
+    fun waitUntilStatusOnPreferredHttpPorts(timeoutMs: Long = 90_000L): JSONObject {
+        return waitUntil(timeoutMs, "HTTP /status on ports 8080–8115") {
+            statusJsonOnPreferredHttpPortsOrNull()
+        }
+    }
+
+    private fun statusJsonOnPreferredHttpPortsOrNull(): JSONObject? {
+        for (candidate in 8080..8115) {
+            val response = runCatching {
+                httpGet("/status", expectedCode = null, readTimeoutMs = 2500, port = candidate)
+            }.getOrNull() ?: continue
+            if (response.statusCode == 200) {
+                return JSONObject(response.bodyText())
+            }
+        }
+        return null
+    }
+
     /**
      * Grants CAMERA and POST_NOTIFICATIONS (API 33+) without launching MainActivity.
      * Used when exercising components such as [com.ipcam.BootReceiver] in isolation.
@@ -250,6 +286,16 @@ class DeviceTestEnvironment {
     fun grantRuntimePermissionsWithoutActivity() {
         requiredRuntimePermissions().forEach { permission ->
             attemptRuntimePermissionGrant(permission)
+        }
+        waitUntil(30_000L, "target app CAMERA/notifications after pm grant") {
+            if (requiredRuntimePermissions().all { permission ->
+                    ContextCompat.checkSelfPermission(appContext, permission) == PackageManager.PERMISSION_GRANTED
+                }
+            ) {
+                Unit
+            } else {
+                null
+            }
         }
     }
 
@@ -314,6 +360,10 @@ class DeviceTestEnvironment {
         closeMainActivity()
         waitForHttpServer()
     }
+
+    /** For Espresso/UI tests that must run actions on the already-launched [MainActivity]. */
+    fun mainActivityScenario(): ActivityScenario<MainActivity> =
+        mainActivityScenario ?: error("MainActivity was not launched")
 
     fun restartAppPreservingState() {
         closeTrackedResources()
@@ -484,7 +534,7 @@ class DeviceTestEnvironment {
                 acceptRuntimePermissionDialogsIfPresent()
             }
 
-            waitUntil(15_000L, "permission $permission to be granted") {
+            waitUntil(30_000L, "permission $permission to be granted") {
                 if (ContextCompat.checkSelfPermission(appContext, permission) == PackageManager.PERMISSION_GRANTED) {
                     Unit
                 } else {
@@ -517,16 +567,20 @@ class DeviceTestEnvironment {
         val packageName = appContext.packageName
         val uiAutomation = instrumentation.uiAutomation
 
+        // Prefer shell grant first: works on most userdebug/engineering devices and avoids
+        // UiAutomation.grantRuntimePermission failures on some OEM builds (e.g. SecurityException).
+        repeat(3) {
+            runShell("pm grant $packageName $permission")
+            Thread.sleep(150)
+        }
+
         runCatching {
             uiAutomation.adoptShellPermissionIdentity()
-            uiAutomation.grantRuntimePermission(packageName, permission)
-        }.recoverCatching {
-            runShell("pm grant $packageName $permission")
-        }.onFailure {
-            // Some OEM builds block shell-based runtime grants. The UI dialog fallback below
-            // handles those devices by accepting the system permission prompt after launch.
-        }.also {
-            runCatching { uiAutomation.dropShellPermissionIdentity() }
+            try {
+                uiAutomation.grantRuntimePermission(packageName, permission)
+            } finally {
+                runCatching { uiAutomation.dropShellPermissionIdentity() }
+            }
         }
     }
 

@@ -37,6 +37,7 @@ kotlinx-serialization = "1.7.3"
 
 # Testing
 junit = "4.13.2"
+robolectric = "4.14.1"
 androidx-test-ext-junit = "1.2.1"
 androidx-test-espresso = "3.6.1"
 androidx-test-core = "1.6.1"
@@ -83,6 +84,7 @@ kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-
 
 # Testing
 junit = { group = "junit", name = "junit", version.ref = "junit" }
+robolectric = { group = "org.robolectric", name = "robolectric", version.ref = "robolectric" }
 androidx-test-ext-junit = { group = "androidx.test.ext", name = "junit", version.ref = "androidx-test-ext-junit" }
 androidx-test-espresso-core = { group = "androidx.test.espresso", name = "espresso-core", version.ref = "androidx-test-espresso" }
 androidx-test-core-ktx = { group = "androidx.test", name = "core-ktx", version.ref = "androidx-test-core" }

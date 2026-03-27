@@ -20,6 +20,7 @@ Automated coverage currently includes:
 - MJPEG streaming, eviction, and cleanup
 - SSE streaming, eviction, and targeted shutdown
 - RTSP handshake, playback, pause/resume, eviction, shutdown, and live bitrate/FPS reconfiguration
+- RTSP UDP transport: SETUP with client/server port negotiation, RTP packet delivery via DatagramSocket, RTP header validation
 - mixed SSE + MJPEG + RTSP consumer scenarios
 - server reachability after MainActivity closes
 - connection accounting and runtime telemetry quiescence
@@ -30,6 +31,14 @@ Automated coverage currently includes:
 - critical-battery streaming policy and override (where shell simulation works)
 - `BootReceiver` autostart behavior without full device reboot
 - target MJPEG/RTSP FPS and RTSP bitrate/mode HTTP APIs
+- camera and reboot diagnostics, log endpoint format validation
+- `/reboot` error path (non-Device Owner 403 response)
+- MainActivity UI: start/stop toggle, preview expand/collapse camera lifecycle
+- web UI asset serving: HTML template resolution, CSS/JS content types, 404 for missing assets
+- performance metrics pressure thresholds (CPU, memory, frame drop) with boundary conditions
+- RTSP bitrate policy bucketing across standard, non-standard, portrait, and boundary resolutions
+- `RebootDiagnostics` and `RebootResult` sealed class variant coverage
+- `InMemoryLogBuffer` circular buffer FIFO eviction and format
 
 Manual testing remains useful for browser UX, external client compatibility, OTA flows, and long-duration thermal checks, but core regressions should be caught by the automated suite first.
 
@@ -44,9 +53,24 @@ Covered areas:
 - `ConnectionLimitsTest`
   - normalization of configured limits
   - migration from legacy max-connections setting
+  - boundary clamping and default companion values
 - `RuntimeTelemetrySamplerTest`
   - bandwidth accounting for MJPEG and RTSP
   - reset semantics for telemetry sampling
+  - ignored non-positive byte counts, sequential delta windows, zero-elapsed-ms floor
+- `PerformanceMetricsTest`
+  - CPU pressure thresholds (NORMAL/HIGH/CRITICAL) with exact boundary values
+  - frame drop rate pressure thresholds with boundary values
+  - heap and system memory pressure detection
+  - detailed stats output format verification
+- `RtspBitratePolicyTest`
+  - pixel-count-based bitrate bucketing for standard resolutions (sub-VGA through 4K)
+  - non-standard resolutions, portrait orientation, boundary pixel counts
+- `DiagnosticModelsTest`
+  - `RebootDiagnostics.create()` decision rules (Device Owner, locked, Samsung Knox)
+  - `RebootResult` sealed class: `isSuccess()` for all variants, `toJson()` structure
+- `InMemoryLogBufferTest`
+  - log entry format, insertion order, clear semantics, FIFO eviction at capacity
 
 Run:
 
@@ -61,7 +85,7 @@ Location:
 - `app/src/androidTest/java/com/ipcam/testsupport`
 
 Current suite size:
-- **59** real-device instrumentation tests across **17** test classes
+- **70** real-device instrumentation tests across **21** test classes
 
 Covered areas by class (each line lists the `@Test` count):
 
@@ -73,7 +97,7 @@ Covered areas by class (each line lists the `@Test` count):
 
 - **`SseStreamingInstrumentedTest`** (6) — SSE event stream happy path, SSE not activating the camera alone, limit eviction, targeted shutdown via `/closeConnection`, and related SSE edge cases.
 
-- **`RtspStreamingInstrumentedTest`** (7) — RTSP `OPTIONS` through `TEARDOWN`, interleaved RTP over TCP, session limit eviction, cleanup without explicit `TEARDOWN`, `PAUSE`/`PLAY` lease behavior, disabling RTSP with an active client, passive `DESCRIBE` lease lifecycle.
+- **`RtspStreamingInstrumentedTest`** (8) — RTSP `OPTIONS` through `TEARDOWN`, interleaved RTP over TCP, UDP transport with DatagramSocket RTP delivery and header validation, session limit eviction, cleanup without explicit `TEARDOWN`, `PAUSE`/`PLAY` lease behavior, disabling RTSP with an active client, passive `DESCRIBE` lease lifecycle, encoder leak check after camera reset.
 
 - **`ConnectionManagementInstrumentedTest`** (6) — mixed SSE + MJPEG + RTSP accounting, camera stays active until the last video consumer disconnects, concurrent MJPEG from distinct client addresses, targeted MJPEG shutdown.
 
@@ -98,6 +122,14 @@ Covered areas by class (each line lists the `@Test` count):
 - **`SnapshotConcurrencyInstrumentedTest`** (3) — concurrent `/snapshot` threads all get JPEGs without wedging; `/snapshot` while MJPEG is active (stream keeps frames); `/snapshot` while RTSP is playing (RTP continues until teardown).
 
 - **`StreamRateAndRtspConfigInstrumentedTest`** (3) — `/setMjpegFps` and `/setRtspFps` validation; RTSP bitrate and bitrate-mode validation; `/rtspStatus` vs live changes while a TCP RTSP session is playing.
+
+- **`DiagnosticsAndLogsInstrumentedTest`** (4) — `/diagnostics/camera` at idle and with active MJPEG, `/diagnostics/reboot` coherence on Device Owner and non-Device Owner devices, `/logs` plain-text format and RTSP log entry presence.
+
+- **`RebootEndpointInstrumentedTest`** (1) — `/reboot` returns 403 with structured JSON on non-Device Owner devices.
+
+- **`MainActivityUiInstrumentedTest`** (2) — start/stop button toggles HTTP server reachability, preview section expand/collapse moves camera between ACTIVE and IDLE.
+
+- **`WebUiAssetsInstrumentedTest`** (3) — `/` and `/index.html` serve resolved HTML with version name and asset references, CSS/JS correct content types, missing asset returns 404.
 
 Run:
 
@@ -283,4 +315,4 @@ Some phones show a Play Protect warning for the instrumentation APK during local
 - [README.md](/Users/aslepov/projects/IP_Cam/README.md)
 - [ARCHITECTURE.md](/Users/aslepov/projects/IP_Cam/documentation/ARCHITECTURE.md)
 
-**Last Updated:** 2026-03-26
+**Last Updated:** 2026-03-27

@@ -89,6 +89,14 @@ class ServerAndLifecycleInstrumentedTest : BaseDeviceCoreTest() {
         // Endpoints array
         val endpoints = status.getJSONArray("endpoints")
         assertTrue("endpoints should list at least 10 routes", endpoints.length() >= 10)
+        val endpointsList = (0 until endpoints.length()).map { endpoints.getString(it) }
+        val requiredEndpoints = listOf(
+            "/status", "/stream", "/snapshot", "/events", "/cameras",
+            "/metrics", "/connections", "/reboot", "/toggleFlashlight"
+        )
+        for (required in requiredEndpoints) {
+            assertTrue("Endpoints array should include $required", required in endpointsList)
+        }
 
         // Version block
         val version = status.getJSONObject("version")

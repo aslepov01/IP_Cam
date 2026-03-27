@@ -61,18 +61,13 @@ class BootReceiverInstrumentedTest {
 
         assertFalse(
             "Precondition: CameraService HTTP must be stopped before boot simulation",
-            runCatching { env.httpGet("/status", readTimeoutMs = 2_000) }.isSuccess
+            httpStatusReachableOnAnyPreferredPort()
         )
 
         BootReceiver().onReceive(appContext, Intent(Intent.ACTION_BOOT_COMPLETED))
 
-        Thread.sleep(4_000)
-        val httpStillUp = runCatching {
-            env.httpGet("/status", readTimeoutMs = 3_000)
-        }.isSuccess
-        assertFalse(
-            "HTTP server must not be reachable when autostart is disabled",
-            httpStillUp
+        assertHttpStaysDownDuringObservationWindow(
+            failMessage = "HTTP server must not be reachable when autostart is disabled"
         )
     }
 
@@ -85,8 +80,7 @@ class BootReceiverInstrumentedTest {
 
         BootReceiver().onReceive(appContext, Intent(Intent.ACTION_BOOT_COMPLETED))
 
-        waitForLoopbackHttp(timeoutMs = 60_000L)
-        val status = env.jsonGet("/status")
+        val status = env.waitUntilStatusOnPreferredHttpPorts(timeoutMs = 90_000L)
         assertTrue(status.getString("status") == "running")
     }
 
@@ -111,8 +105,9 @@ class BootReceiverInstrumentedTest {
 
         BootReceiver().onReceive(appContext, Intent(Intent.ACTION_BOOT_COMPLETED))
 
-        Thread.sleep(4_000)
-        assertFalse(env.isLoopbackHttpServerReachable())
+        assertHttpStaysDownDuringObservationWindow(
+            failMessage = "HTTP must stay down when device-protected autoStart is false"
+        )
     }
 
     private fun writeAutoStartPreference(enabled: Boolean) {
@@ -130,15 +125,45 @@ class BootReceiverInstrumentedTest {
         }
     }
 
-    private fun waitForLoopbackHttp(timeoutMs: Long) {
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
-            if (env.isLoopbackHttpServerReachable()) {
+    /**
+     * Polls loopback HTTP while observing that it stays down: fails immediately if any check sees
+     * a server, returns once [minObservationMs] of consecutive "down" checks elapsed (early as
+     * soon as that bar is met), or fails if [maxWaitMs] is exceeded.
+     */
+    private fun assertHttpStaysDownDuringObservationWindow(
+        minObservationMs: Long = 4_000L,
+        stepMs: Long = 200L,
+        maxWaitMs: Long = 25_000L,
+        failMessage: String
+    ) {
+        val t0 = System.currentTimeMillis()
+        var downSince: Long? = null
+        while (System.currentTimeMillis() - t0 < maxWaitMs) {
+            if (httpStatusReachableOnAnyPreferredPort()) {
+                org.junit.Assert.fail(failMessage)
+            }
+            val now = System.currentTimeMillis()
+            if (downSince == null) {
+                downSince = now
+            }
+            if (now - downSince!! >= minObservationMs) {
                 return
             }
-            Thread.sleep(500)
+            Thread.sleep(stepMs)
         }
-        throw AssertionError("CameraService did not open HTTP port after BootReceiver autostart")
+        org.junit.Assert.fail("$failMessage (timed out after ${maxWaitMs}ms)")
+    }
+
+    private fun httpStatusReachableOnAnyPreferredPort(): Boolean {
+        for (port in 8080..8115) {
+            val ok = runCatching {
+                env.httpGet("/status", expectedCode = null, readTimeoutMs = 2000, port = port).statusCode == 200
+            }.getOrDefault(false)
+            if (ok) {
+                return true
+            }
+        }
+        return false
     }
 
     companion object {

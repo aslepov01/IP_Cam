@@ -7,6 +7,8 @@ import java.io.ByteArrayOutputStream
 import java.io.Closeable
 import java.io.IOException
 import java.net.ConnectException
+import java.net.DatagramPacket
+import java.net.DatagramSocket
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -543,6 +545,185 @@ class RtspTcpClient(
                 }
             }
         }
+    }
+}
+
+class RtspUdpClient(
+    private val host: String,
+    private val port: Int = 8554
+) : Closeable {
+    private val socket: Socket
+    private val input: BufferedInputStream
+    private val output: BufferedOutputStream
+    private var cSeq = 1
+    private var sessionId: String? = null
+    private val streamUrl = "rtsp://$host:$port/stream"
+
+    val rtpSocket = DatagramSocket()
+    private val rtcpSocket = DatagramSocket()
+    val clientRtpPort: Int = rtpSocket.localPort
+    val clientRtcpPort: Int = rtcpSocket.localPort
+    var serverRtpPort: Int = 0; private set
+    var serverRtcpPort: Int = 0; private set
+
+    init {
+        val rtspPort = port
+        val deadline = System.currentTimeMillis() + 15_000L
+        var lastError: IOException? = null
+        var connected: Socket? = null
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                connected = Socket().apply {
+                    connect(InetSocketAddress(host, rtspPort), 2_000)
+                    soTimeout = 2_000
+                }
+                break
+            } catch (e: IOException) {
+                lastError = e
+                runCatching { Thread.sleep(250) }
+            }
+        }
+        if (connected == null) {
+            throw ConnectException("Failed to connect to RTSP server at $host:$port").also {
+                if (lastError != null) it.initCause(lastError)
+            }
+        }
+        socket = connected
+        input = BufferedInputStream(socket.getInputStream())
+        output = BufferedOutputStream(socket.getOutputStream())
+    }
+
+    fun options(): RtspResponse = sendRequest("OPTIONS", streamUrl)
+
+    fun describe(): RtspResponse =
+        sendRequest("DESCRIBE", streamUrl, listOf("Accept: application/sdp"))
+
+    fun setupUdp(): RtspResponse {
+        val response = sendRequest(
+            "SETUP", "$streamUrl/track0",
+            listOf("Transport: RTP/AVP;unicast;client_port=$clientRtpPort-$clientRtcpPort")
+        )
+        response.headers["transport"]?.let { transport ->
+            Regex("server_port=(\\d+)-(\\d+)").find(transport)?.let { match ->
+                serverRtpPort = match.groupValues[1].toInt()
+                serverRtcpPort = match.groupValues[2].toInt()
+            }
+        }
+        return response
+    }
+
+    fun play(): RtspResponse = sendRequest("PLAY", streamUrl)
+
+    fun teardown(): RtspResponse = sendRequest("TEARDOWN", streamUrl)
+
+    fun awaitUdpRtpPacket(timeoutMs: Long = 20_000L): ByteArray {
+        val savedTimeout = rtpSocket.soTimeout
+        rtpSocket.soTimeout = 2_000
+        val deadline = System.currentTimeMillis() + timeoutMs
+        val buffer = ByteArray(65_536)
+        try {
+            while (System.currentTimeMillis() < deadline) {
+                try {
+                    val packet = DatagramPacket(buffer, buffer.size)
+                    rtpSocket.receive(packet)
+                    return buffer.copyOf(packet.length)
+                } catch (_: SocketTimeoutException) {
+                    // Keep waiting.
+                }
+            }
+            throw AssertionError("Timed out waiting for UDP RTP packet from RTSP server")
+        } finally {
+            rtpSocket.soTimeout = savedTimeout
+        }
+    }
+
+    fun awaitDisconnected(timeoutMs: Long = 10_000L): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            try {
+                if (input.read() == -1) return true
+            } catch (_: SocketTimeoutException) {
+                // Keep polling.
+            } catch (_: IOException) {
+                return true
+            }
+        }
+        return false
+    }
+
+    override fun close() {
+        runCatching { rtpSocket.close() }
+        runCatching { rtcpSocket.close() }
+        runCatching { socket.close() }
+    }
+
+    private fun sendRequest(
+        method: String,
+        url: String,
+        extraHeaders: List<String> = emptyList()
+    ): RtspResponse {
+        val request = StringBuilder().apply {
+            append("$method $url RTSP/1.0\r\n")
+            append("CSeq: ${cSeq++}\r\n")
+            sessionId?.let { append("Session: $it\r\n") }
+            extraHeaders.forEach { append(it).append("\r\n") }
+            append("\r\n")
+        }
+        output.write(request.toString().toByteArray(Charsets.UTF_8))
+        output.flush()
+
+        val response = readResponse()
+        response.headers["session"]?.let { raw ->
+            sessionId = raw.substringBefore(';').trim()
+        }
+        return response
+    }
+
+    private fun readResponse(): RtspResponse {
+        val statusLine = readAsciiLine()
+            ?: throw AssertionError("Expected RTSP response but socket closed")
+        val headers = linkedMapOf<String, String>()
+        while (true) {
+            val line = readAsciiLine()
+                ?: throw AssertionError("Expected RTSP headers but socket closed")
+            if (line.isEmpty()) break
+            val sep = line.indexOf(':')
+            if (sep > 0) {
+                headers[line.substring(0, sep).trim().lowercase()] =
+                    line.substring(sep + 1).trim()
+            }
+        }
+        val contentLength = headers["content-length"]?.toIntOrNull() ?: 0
+        val body = if (contentLength > 0) readExact(contentLength).toString(Charsets.UTF_8) else ""
+        val statusCode = statusLine.split(' ').getOrNull(1)?.toIntOrNull()
+            ?: throw AssertionError("Could not parse RTSP status code from '$statusLine'")
+        return RtspResponse(statusCode, statusLine, headers, body)
+    }
+
+    private fun readAsciiLine(): String? {
+        val buf = ByteArrayOutputStream()
+        var prev = -1
+        while (true) {
+            val b = input.read()
+            if (b == -1) return if (buf.size() == 0) null else buf.toString(Charsets.UTF_8.name())
+            if (prev == '\r'.code && b == '\n'.code) {
+                val raw = buf.toByteArray()
+                return raw.copyOf(raw.size - 1).toString(Charsets.UTF_8)
+            }
+            buf.write(b)
+            prev = b
+        }
+    }
+
+    private fun readExact(length: Int): ByteArray {
+        val buffer = ByteArray(length)
+        var offset = 0
+        while (offset < length) {
+            val read = input.read(buffer, offset, length - offset)
+            if (read == -1) throw AssertionError("Expected $length bytes but socket closed after $offset")
+            offset += read
+        }
+        return buffer
     }
 }
 

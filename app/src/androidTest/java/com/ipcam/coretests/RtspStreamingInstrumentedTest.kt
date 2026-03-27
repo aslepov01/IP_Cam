@@ -253,6 +253,54 @@ class RtspStreamingInstrumentedTest : BaseDeviceCoreTest() {
         assertEquals(0, env.waitForRtspActiveEncoderCount(0).getInt("activeEncoders"))
     }
 
+    // Verifies the full RTSP-over-UDP playback handshake: SETUP negotiates UDP transport with
+    // client/server port pairs, PLAY triggers RTP packet delivery via DatagramSocket, the first
+    // received packet has a valid RTP header, and TEARDOWN releases the camera back to IDLE.
+    @Test
+    fun rtspUdpSessionReceivesRtpPacketsViaDatagramSocket() {
+        env.ensureRtspEnabled()
+
+        val client = env.openRtspUdp()
+
+        assertEquals(200, client.options().statusCode)
+
+        val describe = client.describe()
+        assertEquals(200, describe.statusCode)
+        assertTrue("SDP should contain video media line", describe.body.contains("m=video"))
+        assertTrue("SDP should describe H264 codec", describe.body.contains("a=rtpmap:96 H264/90000"))
+
+        val setup = client.setupUdp()
+        assertEquals(200, setup.statusCode)
+        assertTrue("Server should allocate RTP port", client.serverRtpPort > 0)
+        assertTrue("Server should allocate RTCP port", client.serverRtcpPort > 0)
+        val transport = setup.headers["transport"] ?: ""
+        assertTrue("Transport should echo client ports",
+            transport.contains("client_port=${client.clientRtpPort}-${client.clientRtcpPort}"))
+        assertTrue("Transport should include server ports",
+            transport.contains("server_port="))
+
+        val play = client.play()
+        assertEquals(200, play.statusCode)
+
+        val rtpPacket = client.awaitUdpRtpPacket()
+        assertTrue("RTP packet should have at least 12-byte header", rtpPacket.size >= 12)
+        val rtpVersion = (rtpPacket[0].toInt() shr 6) and 0x03
+        assertEquals("RTP version should be 2", 2, rtpVersion)
+        val payloadType = rtpPacket[1].toInt() and 0x7F
+        assertEquals("RTP payload type should be 96 (dynamic H264)", 96, payloadType)
+
+        env.waitForRtspPlayingSessions(1)
+        env.waitForCameraState("ACTIVE")
+
+        val teardown = client.teardown()
+        assertEquals(200, teardown.statusCode)
+        client.close()
+
+        env.waitForRtspPlayingSessions(0)
+        env.waitForNoLongLivedConnections()
+        env.waitForCameraState("IDLE")
+    }
+
     private fun findFirstConnectionId(kind: String): String {
         val connections: JSONArray = env.connectionSnapshots()
         for (index in 0 until connections.length()) {

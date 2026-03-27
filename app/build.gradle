@@ -78,7 +78,10 @@ android {
         versionName versionProps['VERSION_NAME']
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
-        testInstrumentationRunnerArguments clearPackageData: 'true'
+        // `true` clears runtime permissions between tests on many devices; shell `pm grant` then
+        // does not reliably show up in the target app in time (seen on OnePlus/Android 14).
+        // Tests call [DeviceTestEnvironment.shutdownAndReset] for isolation instead.
+        testInstrumentationRunnerArguments clearPackageData: 'false'
         
         // Build configuration fields for version/build info
         buildConfigField "String", "GIT_COMMIT_HASH", "\"${getGitCommitHash()}\""
@@ -107,6 +110,9 @@ android {
     testOptions {
         execution 'ANDROIDX_TEST_ORCHESTRATOR'
         animationsDisabled true
+        unitTests {
+            includeAndroidResources = true
+        }
     }
     adbOptions {
         installOptions '-g'
@@ -135,6 +141,7 @@ dependencies {
     implementation libs.kotlinx.serialization.json
     
     testImplementation libs.junit
+    testImplementation libs.robolectric
     androidTestImplementation libs.androidx.test.ext.junit
     androidTestImplementation libs.androidx.test.core.ktx
     androidTestImplementation libs.androidx.test.espresso.core

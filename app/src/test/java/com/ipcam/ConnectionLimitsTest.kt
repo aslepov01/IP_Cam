@@ -41,4 +41,42 @@ class ConnectionLimitsTest {
         assertEquals(1, converted.maxSseClients)
         assertEquals(1, converted.maxRtspSessions)
     }
+
+    // Legacy value of zero must still produce at least 1 per transport after clamping.
+    @Test
+    fun fromLegacyZeroClampsToMinimumPerTransport() {
+        val converted = ConnectionLimits.fromLegacyMaxConnections(0)
+
+        assertEquals(1, converted.maxMjpegStreams)
+        assertEquals(1, converted.maxSseClients)
+        assertEquals(1, converted.maxRtspSessions)
+    }
+
+    // Legacy values above the maximum must be clamped; RTSP stays at one quarter of the cap.
+    @Test
+    fun fromLegacyLargeValueClampsToMaxWithQuarterRtspSessions() {
+        val converted = ConnectionLimits.fromLegacyMaxConnections(200)
+
+        assertEquals(100, converted.maxMjpegStreams)
+        assertEquals(100, converted.maxSseClients)
+        assertEquals(25, converted.maxRtspSessions)
+    }
+
+    // Values already within the supported range must pass through normalized() unchanged.
+    @Test
+    fun normalizedLeavesInRangeValuesUnchanged() {
+        val limits = ConnectionLimits(10, 20, 30).normalized()
+
+        assertEquals(10, limits.maxMjpegStreams)
+        assertEquals(20, limits.maxSseClients)
+        assertEquals(30, limits.maxRtspSessions)
+    }
+
+    // The DEFAULT companion values must match the documented defaults (32 MJPEG, 16 SSE, 8 RTSP).
+    @Test
+    fun defaultCompanionMatchesExpectedDefaults() {
+        assertEquals(32, ConnectionLimits.DEFAULT.maxMjpegStreams)
+        assertEquals(16, ConnectionLimits.DEFAULT.maxSseClients)
+        assertEquals(8, ConnectionLimits.DEFAULT.maxRtspSessions)
+    }
 }

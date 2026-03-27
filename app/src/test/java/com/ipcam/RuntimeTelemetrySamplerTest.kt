@@ -85,4 +85,101 @@ class RuntimeTelemetrySamplerTest {
         assertEquals(0L, afterReset.rtspBandwidthBps)
         assertFalse(afterReset.isCharging)
     }
+
+    // Zero and negative byte counts must be silently ignored; they must not corrupt bandwidth.
+    @Test
+    fun recordBytesIgnoresZeroAndNegativeValues() {
+        val sampler = RuntimeTelemetrySampler()
+        sampler.reset(nowMs = 1_000L)
+        sampler.recordBytes(StreamTransport.MJPEG, 0L)
+        sampler.recordBytes(StreamTransport.MJPEG, -500L)
+        sampler.recordBytes(StreamTransport.RTSP, -1L)
+
+        val snapshot = sampler.sample(
+            cpuUsagePercent = 0f,
+            currentCameraFps = 0f,
+            currentMjpegFps = 0f,
+            currentRtspFps = 0f,
+            activeHttpStreams = 0,
+            activeSseClients = 0,
+            activeRtspConnections = 0,
+            rtspPlayingSessions = 0,
+            totalCameraClients = 0,
+            totalLongLivedConnections = 0,
+            batteryLevel = 0,
+            isCharging = false,
+            nowMs = 2_000L
+        )
+
+        assertEquals(0L, snapshot.mjpegBandwidthBps)
+        assertEquals(0L, snapshot.rtspBandwidthBps)
+    }
+
+    // Each sample() window must only count bytes recorded since the previous sample, not cumulative.
+    @Test
+    fun sequentialSamplesOnlyCountNewlyRecordedBytes() {
+        val sampler = RuntimeTelemetrySampler()
+        sampler.reset(nowMs = 0L)
+        sampler.recordBytes(StreamTransport.MJPEG, 4_000L)
+        val first = sampler.sample(
+            cpuUsagePercent = 0f,
+            currentCameraFps = 0f,
+            currentMjpegFps = 0f,
+            currentRtspFps = 0f,
+            activeHttpStreams = 0,
+            activeSseClients = 0,
+            activeRtspConnections = 0,
+            rtspPlayingSessions = 0,
+            totalCameraClients = 0,
+            totalLongLivedConnections = 0,
+            batteryLevel = 0,
+            isCharging = false,
+            nowMs = 1_000L
+        )
+        sampler.recordBytes(StreamTransport.MJPEG, 1_000L)
+        val second = sampler.sample(
+            cpuUsagePercent = 0f,
+            currentCameraFps = 0f,
+            currentMjpegFps = 0f,
+            currentRtspFps = 0f,
+            activeHttpStreams = 0,
+            activeSseClients = 0,
+            activeRtspConnections = 0,
+            rtspPlayingSessions = 0,
+            totalCameraClients = 0,
+            totalLongLivedConnections = 0,
+            batteryLevel = 0,
+            isCharging = false,
+            nowMs = 2_000L
+        )
+
+        assertEquals(32_000L, first.mjpegBandwidthBps)
+        assertEquals(8_000L, second.mjpegBandwidthBps)
+    }
+
+    // When the sample timestamp equals the reset timestamp (0ms elapsed), a 1ms floor must
+    // prevent division by zero and still produce a finite bandwidth value.
+    @Test
+    fun elapsedMsFloorPreventsZeroDivisionWhenClockUnchanged() {
+        val sampler = RuntimeTelemetrySampler()
+        sampler.reset(nowMs = 5_000L)
+        sampler.recordBytes(StreamTransport.MJPEG, 1_000L)
+        val snapshot = sampler.sample(
+            cpuUsagePercent = 0f,
+            currentCameraFps = 0f,
+            currentMjpegFps = 0f,
+            currentRtspFps = 0f,
+            activeHttpStreams = 0,
+            activeSseClients = 0,
+            activeRtspConnections = 0,
+            rtspPlayingSessions = 0,
+            totalCameraClients = 0,
+            totalLongLivedConnections = 0,
+            batteryLevel = 0,
+            isCharging = false,
+            nowMs = 5_000L
+        )
+
+        assertEquals(8_000_000L, snapshot.mjpegBandwidthBps)
+    }
 }
